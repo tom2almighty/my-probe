@@ -1,0 +1,106 @@
+name: 构建主控
+
+# 产出各平台的 myprobe-server 单文件：前端先用 bun 构建，再由 rust-embed 编进二进制。
+# 手动触发用于验证，发版时由 release.yml 调用，产物直接进 Release。
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: 前端产物
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: 安装依赖
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: 构建
+        working-directory: web
+        run: bun run build
+
+      # 所有平台复用同一份前端产物，保证各平台二进制里的资源完全一致
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.target }}
+    needs: web
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, archive: tar.gz }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, archive: tar.gz, musl: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.gz }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, archive: tar.gz, musl: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-embed 在编译期读 web/dist，必须先把前端产物放回原位
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.target }}
+
+      - name: 安装 musl 工具链
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: 构建
+        shell: bash
+        # bundled SQLite 是 C 代码，musl 目标得用 musl-gcc 编（变量只对对应 target 生效）
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked -p myprobe-server --target ${{ matrix.target }}
+
+      # -f 用绝对路径，避免 macOS 上的 bsdtar 把它当成 -C 之后的相对路径
+      - name: 打包 tar.gz
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C "target/${{ matrix.target }}/release" -czf \
+            "$GITHUB_WORKSPACE/myprobe-server-${{ matrix.target }}.tar.gz" myprobe-server
+
+      - name: 打包 zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/myprobe-server.exe" `
+            -DestinationPath "myprobe-server-${{ matrix.target }}.zip"
+
+      # 产物名不带版本号，这样 releases/latest/download/<名字> 永远可用
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myprobe-server-${{ matrix.target }}
+          path: myprobe-server-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error

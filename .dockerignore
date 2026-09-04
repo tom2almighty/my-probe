@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target
+# 前端依赖与构建产物（镜像内重新构建）
+web/node_modules
+web/dist
+web/src/flags.generated.css
+# 本地数据与仓库元数据
+data/
+*.db
+*.db-wal
+*.db-shm
+.git
+.github
+.gitignore
+scripts
+Dockerfile
+Dockerfile.agent
+docker-compose.yml
+README.md

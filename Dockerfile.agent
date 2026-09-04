@@ -1,0 +1,24 @@
+# ---------- 阶段 1：构建 Agent ----------
+FROM rust:1.98-slim-trixie AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p myprobe-agent \
+    && mkdir -p /out && cp target/release/myprobe-agent /out/
+
+# ---------- 阶段 2：运行时 ----------
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/myprobe-agent /usr/local/bin/myprobe-agent
+
+# ICMP 探测需要 NET_RAW（docker run --cap-add=NET_RAW）；仅用 TCP 探测时不需要。
+# 采集宿主机指标建议 --network host --pid host，磁盘用量需挂载宿主根目录：-v /:/host:ro
+ENTRYPOINT ["/usr/local/bin/myprobe-agent"]

@@ -1,0 +1,8 @@
+/target
+web/node_modules
+web/dist
+web/src/flags.generated.css
+*.db
+*.db-wal
+*.db-shm
+data/

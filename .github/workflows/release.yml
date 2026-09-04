@@ -1,0 +1,73 @@
+name: 发布
+
+# 唯一由 tag 触发的 workflow：推 v* tag 就把三条构建流水线跑一遍，
+# 二进制进 Release，镜像进 GHCR。手动触发只构建、不发布。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: 主控
+    uses: ./.github/workflows/build-server.yml
+
+  agent:
+    name: 客户端
+    uses: ./.github/workflows/build-agent.yml
+
+  images:
+    name: 镜像
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-images.yml
+
+  publish:
+    name: 发布 Release
+    needs: [server, agent]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # 只取二进制包；web-dist / digest-* 这些中间产物不进 Release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: myprobe-*
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: 计算镜像属主
+        run: echo "OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            一键脚本（主控 / 客户端，二进制或 Docker 部署都支持）：
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/myprobe.sh -o myprobe.sh
+            sudo bash myprobe.sh
+            ```
+
+            Docker 镜像：
+
+            ```bash
+            docker pull ghcr.io/${{ env.OWNER }}/myprobe-server:${{ github.ref_name }}
+            docker pull ghcr.io/${{ env.OWNER }}/myprobe-agent:${{ github.ref_name }}
+            ```
+
+            下面的附件里，`myprobe-server-*` 是主控，`myprobe-agent-*` 是客户端，
+            `*-musl` 为静态链接版本（不挑 glibc 版本，老系统优先选它）。
+            校验和见 `SHA256SUMS`。

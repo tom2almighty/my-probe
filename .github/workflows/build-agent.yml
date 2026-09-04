@@ -1,0 +1,80 @@
+name: 构建客户端
+
+# 产出各平台的 myprobe-agent 单文件。Agent 不含前端资源，所以不需要 bun 那一步。
+# 手动触发用于验证，发版时由 release.yml 调用，产物直接进 Release。
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, archive: tar.gz }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, archive: tar.gz, musl: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.gz }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, archive: tar.gz, musl: true }
+          # 树莓派等 32 位 ARM 设备：本地没有交叉工具链，交给 cross 在容器里编
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-24.04, archive: tar.gz, cross: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agent-${{ matrix.target }}
+
+      - name: 安装 musl 工具链
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: 安装 cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: 构建
+        shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked \
+            -p myprobe-agent --target ${{ matrix.target }}
+
+      - name: 打包 tar.gz
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C "target/${{ matrix.target }}/release" -czf \
+            "$GITHUB_WORKSPACE/myprobe-agent-${{ matrix.target }}.tar.gz" myprobe-agent
+
+      - name: 打包 zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/myprobe-agent.exe" `
+            -DestinationPath "myprobe-agent-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myprobe-agent-${{ matrix.target }}
+          path: myprobe-agent-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error

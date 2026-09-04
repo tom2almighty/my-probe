@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/shared", "crates/server", "crates/agent"]
+
+# 发布产物追求“单文件好分发”：去符号 + thin LTO，体积明显更小
+[profile.release]
+strip = true
+lto = "thin"

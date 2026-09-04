@@ -1,0 +1,46 @@
+services:
+  # 主控：提供后台界面 + API + Agent 接入
+  server:
+    # 想从源码构建就把 image 换成下面两行注释
+    image: ghcr.io/tom2almighty/myprobe-server:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: myprobe-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # 容器内以 uid 10001 运行，首次启动前执行 chown 10001:10001 ./data
+    volumes:
+      - ./data:/data
+    environment:
+      # 首次启动的管理员密码；不设置则自动生成并打印到日志（docker compose logs server）
+      MYPROBE_ADMIN_PASSWORD: ${MYPROBE_ADMIN_PASSWORD:-}
+      # 固定 JWT 密钥可让重启后已登录会话继续有效；留空则自动生成并持久化
+      MYPROBE_JWT_SECRET: ${MYPROBE_JWT_SECRET:-}
+      MYPROBE_RETENTION_DAYS: "14"
+      MYPROBE_OFFLINE_AFTER: "30"
+    security_opt:
+      - no-new-privileges:true
+
+  # Agent：监控宿主机。密钥在后台「服务器 → 新建」时发放。
+  # 需要采集宿主机网卡与进程信息，因此使用 host 网络与 host PID 命名空间。
+  agent:
+    image: ghcr.io/tom2almighty/myprobe-agent:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.agent
+    container_name: myprobe-agent
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    # ICMP 探测需要 NET_RAW；只用 TCP 探测时可以删掉
+    cap_add:
+      - NET_RAW
+    volumes:
+      # 让 Agent 看到宿主机真实磁盘用量（容器自身的 overlay 层会被忽略）
+      - /:/host:ro
+    environment:
+      MYPROBE_AGENT_SERVER: ${MYPROBE_AGENT_SERVER:-ws://127.0.0.1:8000/ws/agent}
+      MYPROBE_AGENT_SECRET: ${MYPROBE_AGENT_SECRET:?需要在 .env 里填入后台发放的接入密钥}
+      MYPROBE_AGENT_NAME: ${MYPROBE_AGENT_NAME:-}
