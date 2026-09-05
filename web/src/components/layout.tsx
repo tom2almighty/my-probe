@@ -16,6 +16,7 @@ import { api, isMock, setToken } from "@/lib/api";
 import { useAsync } from "@/lib/hooks";
 import { Badge } from "@/components/ui/badge";
 import { ChangePasswordDialog } from "@/components/change-password";
+import { ThemeToggle } from "@/components/theme";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -83,12 +84,12 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="border-t p-3">
+        <div className="flex items-center gap-1 border-t p-3">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
                 type="button"
-                className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-sidebar-accent"
+                className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-sidebar-accent"
               >
                 <div className="flex size-7 items-center justify-center rounded-full bg-primary/10 text-primary text-xs font-bold">
                   {username.slice(0, 1).toUpperCase()}
@@ -115,6 +116,7 @@ export default function Layout() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          <ThemeToggle variant="ghost" />
         </div>
       </aside>
 
@@ -140,6 +142,7 @@ export default function Layout() {
               </NavLink>
             ))}
           </nav>
+          <ThemeToggle variant="ghost" />
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button type="button" className="rounded-md p-2 hover:bg-accent">

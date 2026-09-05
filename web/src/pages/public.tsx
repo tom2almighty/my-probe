@@ -8,6 +8,7 @@ import { Flag } from "@/components/flag";
 import { LatencyPanel } from "@/components/latency-panel";
 import { MetricChart, type Series } from "@/components/metric-chart";
 import { OnlineBadge, ProbeTargetChip, UsageBar } from "@/components/status";
+import { ThemeToggle } from "@/components/theme";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -97,7 +98,7 @@ export default function PublicPage() {
   return (
     <div className="min-h-screen bg-muted/30">
       <header className="sticky top-0 z-20 border-b bg-background/85 backdrop-blur">
-        <div className="mx-auto flex h-14 w-full max-w-6xl items-center gap-3 px-4">
+        <div className="mx-auto flex h-14 w-full max-w-6xl items-center gap-2 px-4 sm:gap-3">
           <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
             <Radio className="size-4" />
           </div>
@@ -108,12 +109,14 @@ export default function PublicPage() {
           <Badge variant={online === servers.length && servers.length > 0 ? "success" : "warning"}>
             {online} / {servers.length} 在线
           </Badge>
+          <ThemeToggle />
           <Button variant="outline" size="icon" title="刷新" onClick={reload}>
             <RefreshCw className="size-4" />
           </Button>
           <Button variant={loggedIn ? "default" : "outline"} size="sm" asChild>
-            <Link to={loggedIn ? "/overview" : "/login"}>
-              <LogIn className="size-4" /> {loggedIn ? "进入后台" : "后台登录"}
+            <Link to={loggedIn ? "/overview" : "/login"} title={loggedIn ? "进入后台" : "后台登录"}>
+              <LogIn className="size-4" />
+              <span className="hidden sm:inline">{loggedIn ? "进入后台" : "后台登录"}</span>
             </Link>
           </Button>
         </div>

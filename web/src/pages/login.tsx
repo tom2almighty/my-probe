@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { api, isMock } from "@/lib/api";
 import { setToken } from "@/lib/api";
+import { ThemeToggle } from "@/components/theme";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -32,7 +33,10 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted/40 p-4">
+    <div className="relative flex min-h-screen items-center justify-center bg-muted/40 p-4">
+      <div className="absolute right-4 top-4">
+        <ThemeToggle variant="ghost" />
+      </div>
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center gap-2">
           <div className="flex size-12 items-center justify-center rounded-xl bg-primary text-primary-foreground">

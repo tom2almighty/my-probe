@@ -73,7 +73,11 @@ export function SecretDialog({ open, onOpenChange, serverName, secret }: Props) 
                 title="复制密钥"
                 onClick={() => secret && copySecret(secret)}
               >
-                {copiedSecret ? <Check className="size-4 text-emerald-600" /> : <Copy className="size-4" />}
+                {copiedSecret ? (
+                  <Check className="size-4 text-emerald-600 dark:text-emerald-400" />
+                ) : (
+                  <Copy className="size-4" />
+                )}
               </Button>
             </div>
           </div>

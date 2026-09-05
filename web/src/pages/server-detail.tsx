@@ -1,34 +1,25 @@
-//! 服务器详情页：实时指标、历史图表、延迟探测指派、Agent 接入信息。
+//! 服务器详情页：实时指标、历史图表、Agent 接入信息。延迟探测统一在「延迟探测」页面管理。
 
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   Activity,
   ArrowLeft,
-  ChevronDown,
-  ChevronRight,
   Cpu,
   HardDrive,
   KeyRound,
-  ListChecks,
   MemoryStick,
   Pencil,
-  Plus,
   RefreshCw,
   Trash2,
-  Unlink,
-  Waypoints,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Flag } from "@/components/flag";
-import { LatencyPanel } from "@/components/latency-panel";
 import { MetricChart, type Series } from "@/components/metric-chart";
-import { PickDialog, type PickOption } from "@/components/pick-dialog";
-import { type EditingProbe, ProbeFormDialog, type ProbeFormValue } from "@/components/probe-form";
 import { SecretDialog } from "@/components/secret-dialog";
 import { ServerFormDialog, type ServerFormValue } from "@/components/server-form";
-import { ExpireBadge, OkRate, OnlineBadge, RenewInfo, StatTile } from "@/components/status";
+import { ExpireBadge, OnlineBadge, RenewInfo, StatTile } from "@/components/status";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -45,8 +36,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
-import type { MetricPoint, ProbeItem, ProbeView, Server, ServerDetail } from "@/lib/types";
-import { fmtBytes, fmtLatency, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
+import type { MetricPoint, ServerDetail } from "@/lib/types";
+import { fmtBytes, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
 
 const RANGES = [
   { key: "1h", label: "1 小时", ms: 3_600_000, points: 180 },
@@ -78,8 +69,6 @@ export default function ServerDetailPage() {
   const onError = useErrorHandler();
 
   const detail = useAsync<ServerDetail>(() => api.server(id), [id]);
-  const probeList = useAsync<ProbeItem[]>(() => api.probes(), []);
-  const serverList = useAsync<Server[]>(() => api.servers(), []);
   const [range, setRange] = useState<RangeKey>("1h");
   const cfg = RANGES.find((r) => r.key === range) ?? RANGES[0];
   const history = useAsync<MetricPoint[]>(
@@ -94,12 +83,6 @@ export default function ServerDetailPage() {
   const [secret, setSecret] = useState<string | null>(null);
   const [rotateOpen, setRotateOpen] = useState(false);
   const [delOpen, setDelOpen] = useState(false);
-
-  const [probeOpen, setProbeOpen] = useState(false);
-  const [assignOpen, setAssignOpen] = useState(false);
-  const [editingProbe, setEditingProbe] = useState<EditingProbe | null>(null);
-  const [delProbe, setDelProbe] = useState<ProbeView | null>(null);
-  const [expanded, setExpanded] = useState<number | null>(null);
 
   useUiEvents((e) => {
     if (e.type === "metrics" && e.server_id === id) {
@@ -120,17 +103,6 @@ export default function ServerDetailPage() {
       history.setData((rows) => [...(rows ?? []), p].slice(-720));
     } else if (e.type === "server_status" && e.id === id) {
       setLiveOnline(e.online);
-    } else if (e.type === "probe" && e.server_id === id) {
-      detail.setData((d) =>
-        d
-          ? {
-              ...d,
-              probes: d.probes.map((p) =>
-                p.id === e.probe_id ? { ...p, last: { ts: e.ts, ok: e.ok, latency_ms: e.latency_ms } } : p,
-              ),
-            }
-          : d,
-      );
     } else if (e.type === "servers_changed") {
       detail.reload();
     }
@@ -145,23 +117,6 @@ export default function ServerDetailPage() {
       })),
     [history.data],
   );
-
-  /** 这台客户端当前执行的探测 id，用于指派弹窗的初始勾选。 */
-  const assignedIds = useMemo(() => (detail.data?.probes ?? []).map((p) => p.id), [detail.data]);
-
-  const probeOptions = useMemo<PickOption[]>(
-    () =>
-      (probeList.data ?? []).map((p) => ({
-        id: p.id,
-        label: p.name,
-        hint: `${p.protocol.toUpperCase()} · ${p.protocol === "tcp" && p.port ? `${p.target}:${p.port}` : p.target}`,
-        status: p.enabled ? null : <span className="text-muted-foreground">已暂停</span>,
-      })),
-    [probeList.data],
-  );
-
-  /** 在本页新建探测时默认只勾选当前这台客户端。 */
-  const defaultProbeServers = useMemo(() => [id], [id]);
 
   const saveServer = async (v: ServerFormValue) => {
     try {
@@ -195,75 +150,6 @@ export default function ServerDetailPage() {
     } catch (e) {
       onError(e, "删除失败");
       setDelOpen(false);
-    }
-  };
-
-  const saveProbe = async (v: ProbeFormValue) => {
-    try {
-      if (editingProbe) {
-        await api.updateProbe(editingProbe.id, v);
-        toast.success("探测目标已更新");
-      } else {
-        await api.createProbe(v);
-        toast.success("探测目标已添加");
-      }
-      detail.reload();
-      probeList.reload();
-    } catch (e) {
-      onError(e, "保存失败");
-      throw e;
-    }
-  };
-
-  /** 覆盖这台客户端执行的探测集合。 */
-  const saveAssign = async (probeIds: number[]) => {
-    try {
-      await api.setServerProbes(id, probeIds);
-      toast.success("已更新该客户端的探测");
-      detail.reload();
-      probeList.reload();
-    } catch (e) {
-      onError(e, "保存失败");
-      throw e;
-    }
-  };
-
-  /** 单个探测的快速移除：只解除与这台客户端的关联，探测本身保留。 */
-  const unassign = async (p: ProbeView) => {
-    const rest = (detail.data?.probes ?? []).map((x) => x.id).filter((x) => x !== p.id);
-    try {
-      await api.setServerProbes(id, rest);
-      toast.success(`已停止在本机探测「${p.name}」`);
-      detail.reload();
-      probeList.reload();
-    } catch (e) {
-      onError(e, "操作失败");
-    }
-  };
-
-  const openNewProbe = () => {
-    setEditingProbe(null);
-    setProbeOpen(true);
-  };
-
-  /** 编辑时要带上该探测的完整客户端指派，避免保存后把别的机器踢掉。 */
-  const openEditProbe = (row: ProbeView) => {
-    const full = probeList.data?.find((p) => p.id === row.id);
-    setEditingProbe(full ?? { ...row, server_ids: [id] });
-    setProbeOpen(true);
-  };
-
-  const doDelProbe = async () => {
-    if (!delProbe) return;
-    try {
-      await api.deleteProbe(delProbe.id);
-      toast.success(`已删除「${delProbe.name}」`);
-      detail.reload();
-      probeList.reload();
-    } catch (e) {
-      onError(e, "删除失败");
-    } finally {
-      setDelProbe(null);
     }
   };
 
@@ -420,99 +306,7 @@ export default function ServerDetailPage() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="flex-row flex-wrap items-center justify-between gap-3 space-y-0">
-          <div>
-            <CardTitle className="text-base">延迟探测</CardTitle>
-            <CardDescription>
-              这台客户端正在执行的探测，勾选即可开启 / 关闭，探测目标本身与服务器互不绑定
-            </CardDescription>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => setAssignOpen(true)}>
-              <ListChecks className="size-4" /> 选择探测
-            </Button>
-            <Button size="sm" onClick={openNewProbe}>
-              <Plus className="size-4" /> 新建探测
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          {s.probes.length === 0 ? (
-            <div className="flex flex-col items-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
-              <Waypoints className="size-6" />
-              <span>
-                这台客户端还没有探测任务
-                <br />
-                可以从已有目标里勾选，也可以新建一个
-              </span>
-              <div className="mt-2 flex items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => setAssignOpen(true)}>
-                  <ListChecks className="size-4" /> 选择探测
-                </Button>
-                <Button size="sm" onClick={openNewProbe}>
-                  <Plus className="size-4" /> 新建探测
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="border-y bg-muted/50 text-xs text-muted-foreground">
-                  <tr>
-                    <th className="w-8 px-2 py-2.5" />
-                    <th className="px-3 py-2.5 text-left font-medium">名称</th>
-                    <th className="px-3 py-2.5 text-left font-medium">目标</th>
-                    <th className="px-3 py-2.5 text-left font-medium">最近</th>
-                    <th className="px-3 py-2.5 text-left font-medium">24h 可用率</th>
-                    <th className="px-3 py-2.5 text-left font-medium">平均延迟</th>
-                    <th className="px-3 py-2.5 text-left font-medium">频率</th>
-                    <th className="px-3 py-2.5 text-right font-medium">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {s.probes.map((p) => (
-                    <ProbeRow
-                      key={p.id}
-                      probe={p}
-                      serverId={id}
-                      serverName={s.name}
-                      online={online}
-                      open={expanded === p.id}
-                      onToggle={() => setExpanded((v) => (v === p.id ? null : p.id))}
-                      onEdit={() => openEditProbe(p)}
-                      onUnassign={() => unassign(p)}
-                      onDelete={() => setDelProbe(p)}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
       <ServerFormDialog open={editOpen} onOpenChange={setEditOpen} server={s} onSubmit={saveServer} />
-
-      <ProbeFormDialog
-        open={probeOpen}
-        onOpenChange={setProbeOpen}
-        probe={editingProbe}
-        servers={serverList.data ?? []}
-        defaultServerIds={defaultProbeServers}
-        onSubmit={saveProbe}
-      />
-
-      <PickDialog
-        open={assignOpen}
-        onOpenChange={setAssignOpen}
-        title={`「${s.name}」执行哪些探测`}
-        description="勾选后由这台客户端发起，取消勾选只是停止本机探测，不会删除目标"
-        options={probeOptions}
-        selected={assignedIds}
-        emptyText="还没有任何探测目标，先新建一个"
-        onSubmit={saveAssign}
-      />
 
       <SecretDialog
         open={!!secret}
@@ -549,26 +343,6 @@ export default function ServerDetailPage() {
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               onClick={doDelete}
-            >
-              删除
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <AlertDialog open={!!delProbe} onOpenChange={(v) => !v && setDelProbe(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>删除探测「{delProbe?.name}」？</AlertDialogTitle>
-            <AlertDialogDescription>
-              该目标会从所有客户端上移除，历史探测记录一并删除。只想停掉本机探测的话，用列表里的「停止本机探测」。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={doDelProbe}
             >
               删除
             </AlertDialogAction>
@@ -612,101 +386,5 @@ function ChartBlock({
       </div>
       {children}
     </div>
-  );
-}
-
-function ProbeRow({
-  probe,
-  serverId,
-  serverName,
-  online,
-  open,
-  onToggle,
-  onEdit,
-  onUnassign,
-  onDelete,
-}: {
-  probe: ProbeView;
-  serverId: number;
-  serverName: string;
-  online: boolean;
-  open: boolean;
-  onToggle: () => void;
-  onEdit: () => void;
-  onUnassign: () => void;
-  onDelete: () => void;
-}) {
-  const target = probe.protocol === "tcp" && probe.port ? `${probe.target}:${probe.port}` : probe.target;
-  return (
-    <>
-      <tr className="border-b transition-colors last:border-0 hover:bg-muted/40">
-        <td className="px-2 py-2.5">
-          <Button variant="ghost" size="icon" className="size-7" title="展开延迟曲线" onClick={onToggle}>
-            {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
-          </Button>
-        </td>
-        <td className="px-3 py-2.5">
-          <div className="flex items-center gap-2">
-            <span className="font-medium">{probe.name}</span>
-            {!probe.enabled && <Badge variant="muted">暂停</Badge>}
-          </div>
-        </td>
-        <td className="px-3 py-2.5">
-          <div className="flex items-center gap-2">
-            <Badge variant="outline" className="font-mono uppercase">
-              {probe.protocol}
-            </Badge>
-            <span className="font-mono text-xs text-muted-foreground">{target}</span>
-          </div>
-        </td>
-        <td className="px-3 py-2.5">
-          {probe.last ? (
-            probe.last.ok ? (
-              <span className="tabular-nums">{fmtLatency(probe.last.latency_ms)}</span>
-            ) : (
-              <Badge variant="danger">失败</Badge>
-            )
-          ) : (
-            <span className="text-muted-foreground">—</span>
-          )}
-        </td>
-        <td className="px-3 py-2.5">
-          <OkRate ok={probe.ok_24h} />
-        </td>
-        <td className="px-3 py-2.5 tabular-nums">{fmtLatency(probe.avg_latency_ms)}</td>
-        <td className="whitespace-nowrap px-3 py-2.5 text-xs text-muted-foreground">
-          每 {probe.interval_s}s / {probe.timeout_ms}ms 超时
-        </td>
-        <td className="whitespace-nowrap px-3 py-2.5 text-right">
-          <Button variant="ghost" size="icon" title="编辑" onClick={onEdit}>
-            <Pencil className="size-4" />
-          </Button>
-          <Button variant="ghost" size="icon" title="停止本机探测" onClick={onUnassign}>
-            <Unlink className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            title="删除探测目标"
-            className="text-destructive hover:text-destructive"
-            onClick={onDelete}
-          >
-            <Trash2 className="size-4" />
-          </Button>
-        </td>
-      </tr>
-      {open && (
-        <tr className="border-b bg-muted/20 last:border-0">
-          <td colSpan={8} className="px-4 py-3">
-            <LatencyPanel
-              probeId={probe.id}
-              targets={[{ server_id: serverId, server_name: serverName, online }]}
-              lockedServerId={serverId}
-              load={api.probeHistory}
-            />
-          </td>
-        </tr>
-      )}
-    </>
   );
 }
