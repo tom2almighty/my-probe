@@ -302,7 +302,7 @@ async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut Pe
                     st.db.touch_last_seen(server_id, m.ts);
                     persist.last_metric = Some(now);
                     persist.metric_writes += 1;
-                    if persist.metric_writes % PRUNE_EVERY == 0 {
+                    if persist.metric_writes.is_multiple_of(PRUNE_EVERY) {
                         st.db.prune_metrics(server_id, MAX_METRIC_ROWS);
                     }
                 }
@@ -331,7 +331,7 @@ async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut Pe
                 } else {
                     persist.last_probe.insert(r.probe_id, now);
                     persist.probe_writes += 1;
-                    if persist.probe_writes % PRUNE_EVERY == 0 {
+                    if persist.probe_writes.is_multiple_of(PRUNE_EVERY) {
                         st.db.prune_probe_results(server_id, MAX_PROBE_ROWS);
                     }
                 }
