@@ -184,7 +184,9 @@ pub async fn update_scheme(
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "配色方案不存在"))?;
     let name = scheme_name(&req.name)?;
     validate_bands(&req.bands).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
-    st.db.update_latency_scheme(id, name, &req.bands).map_err(dup_name)?;
+    st.db
+        .update_latency_scheme(id, name, &req.bands)
+        .map_err(dup_name)?;
     st.ui_broadcast();
     Ok(Json(serde_json::json!({ "ok": true })))
 }

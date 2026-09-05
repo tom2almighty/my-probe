@@ -103,7 +103,10 @@ pub async fn change_username(
     if !(3..=32).contains(&len) {
         return Err(err(StatusCode::BAD_REQUEST, "用户名长度需为 3-32 个字符"));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
         return Err(err(StatusCode::BAD_REQUEST, "用户名只能包含字母、数字与 _ . -"));
     }
     let hash = admin_password_hash(&st.db);

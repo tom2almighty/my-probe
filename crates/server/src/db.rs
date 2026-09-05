@@ -288,7 +288,9 @@ impl Db {
     pub fn list_servers(&self) -> Vec<Server> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
-            .prepare(&format!("SELECT {SERVER_COLS} FROM servers ORDER BY sort_order, id"))
+            .prepare(&format!(
+                "SELECT {SERVER_COLS} FROM servers ORDER BY sort_order, id"
+            ))
             .unwrap();
         stmt.query_map([], row_to_server)
             .unwrap()
