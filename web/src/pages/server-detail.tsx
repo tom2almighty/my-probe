@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   Activity,
+  ArrowDownUp,
   ArrowLeft,
   Cpu,
   HardDrive,
@@ -11,6 +12,7 @@ import {
   MemoryStick,
   Pencil,
   RefreshCw,
+  SlidersHorizontal,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -29,7 +31,8 @@ import {
 } from "@/components/metric-chart";
 import { SecretDialog } from "@/components/secret-dialog";
 import { ServerFormDialog, type ServerFormValue } from "@/components/server-form";
-import { ExpireBadge, OnlineBadge, RenewInfo, StatTile } from "@/components/status";
+import { ExpireBadge, OnlineBadge, RenewInfo, StatTile, TrafficBar } from "@/components/status";
+import { TrafficResetDialog } from "@/components/traffic-reset-dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -46,7 +49,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
-import type { MetricPoint, ServerDetail } from "@/lib/types";
+import { modeLabel, trafficText, withLiveUsed } from "@/lib/traffic";
+import type { MetricPoint, ServerDetail, TrafficCycle } from "@/lib/types";
 import { fmtBytes, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
 
 export default function ServerDetailPage() {
@@ -64,12 +68,15 @@ export default function ServerDetailPage() {
   );
 
   const [liveM, setLiveM] = useState<MetricPoint | null>(null);
+  // 实时事件里的已用流量（0 表示这条事件没带，沿用快照）
+  const [liveUsed, setLiveUsed] = useState(0);
   const [liveOnline, setLiveOnline] = useState<boolean | null>(null);
 
   const [editOpen, setEditOpen] = useState(false);
   const [secret, setSecret] = useState<string | null>(null);
   const [rotateOpen, setRotateOpen] = useState(false);
   const [delOpen, setDelOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
 
   useUiEvents((e) => {
     if (e.type === "metrics" && e.server_id === id) {
@@ -86,6 +93,7 @@ export default function ServerDetailPage() {
         uptime: e.uptime,
       };
       setLiveM(p);
+      setLiveUsed(e.traffic_used);
       setLiveOnline(true);
       history.setData((rows) => [...(rows ?? []), p].slice(-1000));
     } else if (e.type === "server_status" && e.id === id) {
@@ -104,6 +112,19 @@ export default function ServerDetailPage() {
       detail.reload();
     } catch (e) {
       onError(e, "保存失败");
+      throw e;
+    }
+  };
+
+  const doResetTraffic = async (usedBytes?: number) => {
+    try {
+      await api.resetTraffic(id, usedBytes);
+      toast.success("已校正本周期流量");
+      // 实时覆盖值已经过期，等下一次上报重新累加
+      setLiveUsed(0);
+      detail.reload();
+    } catch (e) {
+      onError(e, "校正失败");
       throw e;
     }
   };
@@ -143,6 +164,7 @@ export default function ServerDetailPage() {
 
   const online = liveOnline ?? s.online;
   const m = online ? (liveM ?? s.latest) : null;
+  const traffic = withLiveUsed(s.traffic, liveUsed);
 
   return (
     <div className="space-y-5">
@@ -187,7 +209,7 @@ export default function ServerDetailPage() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
         <StatTile
           label="CPU"
           value={m ? fmtPct(m.cpu) : "—"}
@@ -212,6 +234,21 @@ export default function ServerDetailPage() {
           value={m ? `↓ ${fmtBytes(m.net_in)}/s` : "—"}
           hint={m ? `↑ ${fmtBytes(m.net_out)}/s` : "等待上报"}
           icon={<Activity className="size-4" />}
+        />
+        <StatTile
+          label="本周期流量"
+          value={traffic.pct == null ? fmtBytes(traffic.used) : fmtPct(traffic.pct)}
+          hint={traffic.pct == null ? `不限额 · ${modeLabel(traffic.mode)}` : trafficText(traffic)}
+          icon={<ArrowDownUp className="size-4" />}
+          tone={
+            traffic.pct == null
+              ? "default"
+              : traffic.pct >= 100
+                ? "danger"
+                : traffic.pct >= 80
+                  ? "warning"
+                  : "default"
+          }
         />
       </div>
 
@@ -250,6 +287,38 @@ export default function ServerDetailPage() {
       <Card>
         <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
           <div className="min-w-0">
+            <CardTitle className="text-base">流量</CardTitle>
+            <CardDescription>
+              由 Agent 采集网卡累计值折算，与服务商账单会有差异；周期按 UTC 计算
+            </CardDescription>
+          </div>
+          <Button variant="outline" size="sm" className="shrink-0" onClick={() => setResetOpen(true)}>
+            <SlidersHorizontal className="size-3.5" /> 校正
+          </Button>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <TrafficBar traffic={traffic} label={`本周期 · ${modeLabel(traffic.mode)}`} />
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <InfoItem label="下行">
+              <span className="tabular-nums">{fmtBytes(traffic.rx)}</span>
+            </InfoItem>
+            <InfoItem label="上行">
+              <span className="tabular-nums">{fmtBytes(traffic.tx)}</span>
+            </InfoItem>
+            <InfoItem label="周期起点">
+              {traffic.cycle_start ? utcDay(traffic.cycle_start) : "不分周期"}
+            </InfoItem>
+            <InfoItem label="下次重置">
+              {traffic.next_reset == null ? "不重置" : utcDay(traffic.next_reset)}
+            </InfoItem>
+          </div>
+          {s.traffic_history.length > 0 && <TrafficHistory rows={s.traffic_history} />}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
+          <div className="min-w-0">
             <CardTitle className="text-base">历史指标</CardTitle>
             <CardDescription>
               {rows.length ? `${rows.length} 个采样点` : "暂无采样"}，长范围由主控按时间桶聚合
@@ -271,6 +340,13 @@ export default function ServerDetailPage() {
       </Card>
 
       <ServerFormDialog open={editOpen} onOpenChange={setEditOpen} server={s} onSubmit={saveServer} />
+
+      <TrafficResetDialog
+        open={resetOpen}
+        onOpenChange={setResetOpen}
+        traffic={traffic}
+        onSubmit={doResetTraffic}
+      />
 
       <SecretDialog
         open={!!secret}
@@ -322,6 +398,45 @@ function InfoItem({ label, children }: { label: string; children: React.ReactNod
     <div className="space-y-1">
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="text-sm">{children}</div>
+    </div>
+  );
+}
+
+/** 周期边界一律按 UTC 展示，避免和主控的算法看起来差一天。 */
+function utcDay(ts: number): string {
+  const d = new Date(ts);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${mm}-${dd}`;
+}
+
+/** 已归档的历史周期：不分周期的机器没有这张表。计费口径以当前设置为准。 */
+function TrafficHistory({ rows }: { rows: TrafficCycle[] }) {
+  return (
+    <div className="space-y-2 border-t pt-4">
+      <div className="text-xs font-medium text-muted-foreground">历史周期</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-xs text-muted-foreground">
+            <tr>
+              <th className="py-1.5 pr-3 text-left font-medium">周期起点</th>
+              <th className="px-3 py-1.5 text-right font-medium">下行</th>
+              <th className="px-3 py-1.5 text-right font-medium">上行</th>
+              <th className="py-1.5 pl-3 text-right font-medium">计费用量</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((c) => (
+              <tr key={c.cycle_start} className="border-t">
+                <td className="whitespace-nowrap py-1.5 pr-3">{utcDay(c.cycle_start)}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{fmtBytes(c.rx)}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{fmtBytes(c.tx)}</td>
+                <td className="py-1.5 pl-3 text-right font-medium tabular-nums">{fmtBytes(c.used)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

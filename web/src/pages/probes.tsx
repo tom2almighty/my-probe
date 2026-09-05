@@ -1,9 +1,10 @@
 //! 延迟探测页：探测目标独立于服务器，这里集中管理并指派执行的客户端。
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
+  Palette,
   Pencil,
   Plus,
   RefreshCw,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { BandsEditor } from "@/components/bands-editor";
 import { Flag } from "@/components/flag";
 import { LatencyPanel } from "@/components/latency-panel";
 import { PickDialog, type PickOption } from "@/components/pick-dialog";
@@ -32,11 +34,20 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
-import type { ProbeItem, Server } from "@/lib/types";
+import { DEFAULT_BANDS, validateBands } from "@/lib/latency";
+import type { LatencyBand, ProbeItem, Server } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type Filter = "all" | "enabled" | "paused";
@@ -44,12 +55,14 @@ type Filter = "all" | "enabled" | "paused";
 export default function ProbesPage() {
   const { data, loading, reload, setData } = useAsync<ProbeItem[]>(() => api.probes(), []);
   const servers = useAsync<Server[]>(() => api.servers(), []);
+  const bands = useAsync<LatencyBand[]>(() => api.latencyBands(), []);
   const onError = useErrorHandler();
 
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [formOpen, setFormOpen] = useState(false);
+  const [bandsOpen, setBandsOpen] = useState(false);
   const [editing, setEditing] = useState<EditingProbe | null>(null);
   const [assigning, setAssigning] = useState<ProbeItem | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProbeItem | null>(null);
@@ -176,6 +189,9 @@ export default function ProbesPage() {
             共 {data?.length ?? 0} 个目标，{busyServers} 台客户端在执行
           </p>
         </div>
+        <Button variant="outline" size="sm" onClick={() => setBandsOpen(true)}>
+          <Palette className="size-4" /> 默认配色
+        </Button>
         <Button variant="outline" size="icon" title="刷新" onClick={reload}>
           <RefreshCw className="size-4" />
         </Button>
@@ -263,7 +279,18 @@ export default function ProbesPage() {
         onOpenChange={setFormOpen}
         probe={editing}
         servers={servers.data ?? []}
+        defaultBands={bands.data ?? DEFAULT_BANDS}
         onSubmit={save}
+      />
+
+      <DefaultBandsDialog
+        open={bandsOpen}
+        onOpenChange={setBandsOpen}
+        value={bands.data ?? DEFAULT_BANDS}
+        onSaved={() => {
+          bands.reload();
+          reload();
+        }}
       />
 
       <PickDialog
@@ -374,17 +401,82 @@ function ProbeCard({
         ) : (
           <div className="flex flex-wrap gap-2">
             {probe.targets.map((t) => (
-              <ProbeTargetChip key={t.server_id} target={t} />
+              <ProbeTargetChip key={t.server_id} target={t} bands={probe.bands} />
             ))}
           </div>
         )}
 
         {open && (
           <div className="border-t pt-3">
-            <LatencyPanel probeId={probe.id} targets={probe.targets} load={api.probeHistory} />
+            <LatencyPanel
+              probeId={probe.id}
+              targets={probe.targets}
+              load={api.probeHistory}
+              bands={probe.bands}
+            />
           </div>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** 全局默认配色：没单独配置的探测目标都跟着它变。 */
+function DefaultBandsDialog({
+  open,
+  onOpenChange,
+  value,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  value: LatencyBand[];
+  onSaved: () => void;
+}) {
+  const [draft, setDraft] = useState<LatencyBand[]>(value);
+  const [saving, setSaving] = useState(false);
+  const onError = useErrorHandler();
+
+  // 打开那一刻取当前值：弹窗关着时父页面刷新不该冲掉正在编辑的草稿
+  useEffect(() => {
+    if (open) setDraft(value.map((b) => ({ ...b })));
+  }, [open, value]);
+
+  const submit = async () => {
+    const bad = validateBands(draft);
+    if (bad) return toast.error(bad);
+    setSaving(true);
+    try {
+      await api.saveLatencyBands(draft);
+      toast.success("已保存默认配色");
+      onSaved();
+      onOpenChange(false);
+    } catch (e) {
+      onError(e, "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>默认延迟配色</DialogTitle>
+          <DialogDescription>
+            按延迟快慢分段上色，图表背景带与延迟数字都用它。单独配置过配色的目标不受影响。
+          </DialogDescription>
+        </DialogHeader>
+        <BandsEditor value={draft} onChange={setDraft} />
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button type="button" disabled={saving} onClick={submit}>
+            {saving ? "保存中…" : "保存"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

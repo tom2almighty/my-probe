@@ -33,6 +33,8 @@ pub enum UiEvent {
         net_out: u64,
         load1: f64,
         uptime: u64,
+        /// 本周期已用流量（已按计费口径折算）。老 Agent 不上报累计值时为 0。
+        traffic_used: u64,
     },
     /// 最新延迟探测结果。
     Probe {
@@ -253,11 +255,62 @@ pub struct ServerView {
     pub secret_preview: String,
     /// Agent 上报的自身版本，用于看出哪台还没更新（从未连接过时为 null）。
     pub agent_version: Option<String>,
+    /// 本周期流量用量与限额。
+    pub traffic: TrafficView,
     /// 最新一次上报的整机指标（无数据时为 null）。
     pub latest: Option<models::MetricPoint>,
 }
 
-pub fn server_view(s: &models::Server, online: bool, latest: Option<models::MetricPoint>) -> ServerView {
+/// 流量视图：公开页与后台共用同一形状。
+#[derive(Serialize, Clone, Copy)]
+pub struct TrafficView {
+    /// 本周期下行累计（字节）。
+    pub rx: u64,
+    /// 本周期上行累计（字节）。
+    pub tx: u64,
+    /// 按计费口径折算的已用量。
+    pub used: u64,
+    /// 周期限额（字节），0 = 不限制。
+    pub limit: u64,
+    pub mode: models::TrafficMode,
+    /// 每月重置日 1-28，0 = 不重置。
+    pub reset_day: u32,
+    /// 已用百分比；未设限额时为 null。
+    pub pct: Option<f32>,
+    /// 当前周期起点（unix 毫秒），0 = 不分周期。
+    pub cycle_start: i64,
+    /// 下次重置时刻（unix 毫秒），不重置时为 null。
+    pub next_reset: Option<i64>,
+}
+
+/// 把限额设置与累计用量拼成视图。
+///
+/// 周期重置是「下次上报时惰性执行」的，机器跨过重置日却一直没上报时库里还是
+/// 上一周期的数字 —— 这里按算出来的周期起点先归零，等 Agent 回来再真正落库。
+pub fn traffic_view(plan: &models::TrafficPlan, u: &models::TrafficUsage) -> TrafficView {
+    let cycle_start = plan.cycle_start(chrono::Utc::now());
+    let stale = u.cycle_start < cycle_start;
+    let (rx, tx) = if stale { (0, 0) } else { (u.rx, u.tx) };
+    let used = plan.mode.used(rx, tx);
+    TrafficView {
+        rx,
+        tx,
+        used,
+        limit: plan.limit_bytes,
+        mode: plan.mode,
+        reset_day: plan.reset_day,
+        pct: (plan.limit_bytes > 0).then(|| used as f32 / plan.limit_bytes as f32 * 100.0),
+        cycle_start,
+        next_reset: plan.next_reset(chrono::Utc::now()),
+    }
+}
+
+pub fn server_view(
+    s: &models::Server,
+    online: bool,
+    latest: Option<models::MetricPoint>,
+    traffic: &models::TrafficUsage,
+) -> ServerView {
     ServerView {
         id: s.id,
         name: s.name.clone(),
@@ -274,12 +327,13 @@ pub fn server_view(s: &models::Server, online: bool, latest: Option<models::Metr
         days_to_expire: s.days_to_expire(),
         secret_preview: mask_secret(&s.secret),
         agent_version: s.agent_version.clone(),
+        traffic: traffic_view(&s.traffic, traffic),
         latest,
     }
 }
 
 /// 公开视图：不登录也能看到的字段。资产信息（到期日、续费价格、备注）
-/// 与接入密钥一律不出现在这里。
+/// 与接入密钥一律不出现在这里。流量属于状态信息，和 CPU 同级，默认公开。
 #[derive(Serialize)]
 pub struct PublicServerView {
     pub id: i64,
@@ -287,6 +341,7 @@ pub struct PublicServerView {
     pub country: String,
     pub online: bool,
     pub last_seen: i64,
+    pub traffic: TrafficView,
     pub latest: Option<models::MetricPoint>,
 }
 
@@ -294,6 +349,7 @@ pub fn public_server_view(
     s: &models::Server,
     online: bool,
     latest: Option<models::MetricPoint>,
+    traffic: &models::TrafficUsage,
 ) -> PublicServerView {
     PublicServerView {
         id: s.id,
@@ -301,6 +357,7 @@ pub fn public_server_view(
         country: s.country.clone(),
         online,
         last_seen: s.last_seen,
+        traffic: traffic_view(&s.traffic, traffic),
         latest,
     }
 }
@@ -403,4 +460,16 @@ pub fn clear_timed_alerts(state: &AppState) {
         .lock()
         .unwrap()
         .retain(|k, _| !k.starts_with("expire:"));
+}
+
+/// 周期重置 / 手动校正后清掉这台机器的流量告警去重键，下个周期能重新触发。
+pub fn clear_traffic_alerts(state: &AppState, server_id: i64) {
+    let keys = [
+        format!("traffic:{server_id}"),
+        format!("traffic-full:{server_id}"),
+    ];
+    let mut map = state.alerts.fired.lock().unwrap();
+    for k in keys {
+        map.remove(&k);
+    }
 }

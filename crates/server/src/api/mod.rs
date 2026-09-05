@@ -68,7 +68,12 @@ pub fn protected_router() -> Router<AppState> {
             get(servers::probes).put(servers::set_probes),
         )
         .route("/api/servers/{id}/metrics", get(servers::metrics_history))
+        .route("/api/servers/{id}/traffic/reset", post(servers::traffic_reset))
         .route("/api/probes", get(probes::list).post(probes::create))
+        .route(
+            "/api/latency-bands",
+            get(probes::bands_default).put(probes::set_bands_default),
+        )
         .route("/api/probes/{pid}", put(probes::update).delete(probes::destroy))
         .route("/api/probes/{pid}/servers", put(probes::assign))
         .route("/api/probes/{pid}/history", get(probes::history))

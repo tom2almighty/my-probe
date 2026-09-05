@@ -34,8 +34,9 @@ import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
-import type { MetricPoint, Server } from "@/lib/types";
-import { fmtBytes, fmtTime, pct } from "@/lib/utils";
+import { modeLabel, resetText, trafficText, withLiveUsed } from "@/lib/traffic";
+import type { MetricPoint, Server, Traffic } from "@/lib/types";
+import { fmtBytes, fmtPct, fmtTime, pct } from "@/lib/utils";
 
 type Filter = "all" | "online" | "offline";
 
@@ -44,6 +45,8 @@ export default function ServersPage() {
   const onError = useErrorHandler();
 
   const [live, setLive] = useState<Record<number, MetricPoint>>({});
+  // 流量用量单独存：实时事件只带折算后的总量，rx/tx 仍取快照里的
+  const [liveUsed, setLiveUsed] = useState<Record<number, number>>({});
   const [onlineMap, setOnlineMap] = useState<Record<number, boolean>>({});
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -71,6 +74,7 @@ export default function ServersPage() {
           uptime: e.uptime,
         },
       }));
+      if (e.traffic_used) setLiveUsed((t) => ({ ...t, [e.server_id]: e.traffic_used }));
       setOnlineMap((m) => (m[e.server_id] ? m : { ...m, [e.server_id]: true }));
     } else if (e.type === "server_status") {
       setOnlineMap((m) => ({ ...m, [e.id]: e.online }));
@@ -84,7 +88,12 @@ export default function ServersPage() {
     return (data ?? [])
       .map((s) => {
         const online = onlineMap[s.id] ?? s.online;
-        return { s, online, m: online ? (live[s.id] ?? s.latest) : null };
+        return {
+          s,
+          online,
+          m: online ? (live[s.id] ?? s.latest) : null,
+          traffic: withLiveUsed(s.traffic, liveUsed[s.id]),
+        };
       })
       .filter(({ s, online }) => {
         if (filter === "online" && !online) return false;
@@ -97,7 +106,7 @@ export default function ServersPage() {
           countryName(s.country).toLowerCase().includes(kw)
         );
       });
-  }, [data, live, onlineMap, q, filter]);
+  }, [data, live, liveUsed, onlineMap, q, filter]);
 
   // 所有机器里最高的 Agent 版本，用来标出哪台还没更新
   const newestVersion = useMemo(() => {
@@ -226,13 +235,14 @@ export default function ServersPage() {
                 <th className="px-3 py-2.5 text-left font-medium">内存</th>
                 <th className="px-3 py-2.5 text-left font-medium">磁盘</th>
                 <th className="px-3 py-2.5 text-left font-medium">网络</th>
+                <th className="px-3 py-2.5 text-left font-medium">流量</th>
                 <th className="px-3 py-2.5 text-left font-medium">到期</th>
                 <th className="px-3 py-2.5 text-left font-medium">续费</th>
                 <th className="px-3 py-2.5 text-right font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ s, online, m }) => (
+              {rows.map(({ s, online, m, traffic }) => (
                 <tr key={s.id} className="border-b transition-colors last:border-0 hover:bg-muted/40">
                   <td className="px-4 py-2.5">
                     <div className="flex items-center gap-2">
@@ -281,6 +291,9 @@ export default function ServersPage() {
                     )}
                   </td>
                   <td className="px-3 py-2.5">
+                    <TrafficCell traffic={traffic} />
+                  </td>
+                  <td className="px-3 py-2.5">
                     <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
                   </td>
                   <td className="px-3 py-2.5 text-sm">
@@ -307,7 +320,7 @@ export default function ServersPage() {
 
       {/* 移动端卡片 */}
       <div className="space-y-3 lg:hidden">
-        {rows.map(({ s, online, m }) => (
+        {rows.map(({ s, online, m, traffic }) => (
           <Card key={s.id}>
             <CardContent className="space-y-3 p-4">
               <div className="flex items-start gap-2">
@@ -333,6 +346,16 @@ export default function ServersPage() {
                 <MiniUsage label="CPU" pct={m ? m.cpu : null} />
                 <MiniUsage label="内存" pct={m ? pct(m.mem_used, m.mem_total) : null} />
                 <MiniUsage label="磁盘" pct={m ? pct(m.disk_used, m.disk_total) : null} />
+              </div>
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="text-muted-foreground">
+                  流量 · {modeLabel(traffic.mode)}
+                  {traffic.limit > 0 && traffic.next_reset != null ? ` · ${resetText(traffic)}` : ""}
+                </span>
+                <span className="tabular-nums">
+                  {trafficText(traffic)}
+                  {traffic.pct != null && <span className="ml-1 font-medium">（{fmtPct(traffic.pct)}）</span>}
+                </span>
               </div>
               <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs">
                 <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
@@ -400,6 +423,28 @@ export default function ServersPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+/** 表格里的流量格：限额存在时给「已用 / 限额 + 细条」，否则只报已用量。 */
+function TrafficCell({ traffic }: { traffic: Traffic }) {
+  const hint = `${modeLabel(traffic.mode)} · ${resetText(traffic)}`;
+  if (traffic.limit <= 0) {
+    return (
+      <div className="min-w-24 whitespace-nowrap text-xs" title={hint}>
+        <div className="tabular-nums">{fmtBytes(traffic.used)}</div>
+        <div className="text-[11px] text-muted-foreground">不限额</div>
+      </div>
+    );
+  }
+  return (
+    <div className="min-w-24 space-y-1" title={hint}>
+      <div className="flex items-baseline justify-between gap-1.5 whitespace-nowrap text-xs">
+        <span className="tabular-nums">{trafficText(traffic)}</span>
+        <span className="font-medium tabular-nums">{fmtPct(traffic.pct ?? 0)}</span>
+      </div>
+      <Progress value={traffic.pct ?? 0} className="h-1" />
     </div>
   );
 }

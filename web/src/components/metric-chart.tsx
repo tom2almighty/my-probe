@@ -7,13 +7,16 @@ import {
   ComposedChart,
   Line,
   LineChart,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
-import type { MetricPoint, ProbePoint } from "@/lib/types";
+import { Flag } from "@/components/flag";
+import { DEFAULT_BANDS, latencyColor, resolveBands } from "@/lib/latency";
+import type { LatencyBand, MetricPoint, ProbePoint } from "@/lib/types";
 import { cn, fmtAxis, fmtBytes, fmtLatency, fmtPct, fmtTime, pct } from "@/lib/utils";
 
 /** 历史图表的时间范围。points 控制在后端 clamp 的上限（1000 点）之内。 */
@@ -26,14 +29,29 @@ export const METRIC_RANGES = [
 
 export type RangeKey = (typeof METRIC_RANGES)[number]["key"];
 
-/** 多线路对比用的固定色序，超出后循环。 */
+/** 多线路对比用的固定色序，超出后循环取色、靠虚线区分。 */
 export const SERIES_COLORS = [
   "var(--chart-1)",
   "var(--chart-2)",
   "var(--chart-3)",
   "var(--chart-4)",
   "var(--chart-5)",
+  "var(--chart-6)",
+  "var(--chart-7)",
+  "var(--chart-8)",
 ];
+
+/** 第 i 条线的颜色。下标固定绑定实体（节点 / 目标），取消勾选时其余线不换色。 */
+export function seriesColor(i: number): string {
+  return SERIES_COLORS[i % SERIES_COLORS.length];
+}
+
+/** 超过一轮色序后改虚线，两条同色线也能分清。 */
+export function seriesDash(i: number): string | undefined {
+  const round = Math.floor(i / SERIES_COLORS.length);
+  if (round === 0) return undefined;
+  return round === 1 ? "5 3" : "2 2";
+}
 
 /** 时间范围切换，ranges 可以只给子集。 */
 export function RangeTabs<K extends string>({
@@ -66,6 +84,15 @@ export function RangeTabs<K extends string>({
   );
 }
 
+/** 图例条目。多节点对比时带上国旗，虚线序列的色块也画成虚线。 */
+export interface LegendItem {
+  label: string;
+  color: string;
+  /** 两位国家码，有值时在色块前补一个国旗 */
+  country?: string;
+  dashed?: boolean;
+}
+
 /** 图表分块：标题 + 图例，后台与公开页共用。 */
 export function ChartBlock({
   title,
@@ -74,7 +101,7 @@ export function ChartBlock({
   children,
 }: {
   title: string;
-  legend: { label: string; color: string }[];
+  legend: LegendItem[];
   hint?: string;
   children: React.ReactNode;
 }) {
@@ -85,7 +112,12 @@ export function ChartBlock({
         <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
           {legend.map((l) => (
             <span key={l.label} className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full" style={{ background: l.color }} />
+              {l.country && <Flag code={l.country} />}
+              {l.dashed ? (
+                <span className="w-3 border-t-2 border-dashed" style={{ borderColor: l.color }} />
+              ) : (
+                <span className="size-2 rounded-full" style={{ background: l.color }} />
+              )}
               {l.label}
             </span>
           ))}
@@ -299,26 +331,37 @@ export function probeStats(rows: ProbePoint[]): ProbeStats {
 
 /**
  * 最近若干次探测的条带图：一眼看出波动与丢包。
- * 柱高对应延迟，橙色表示这一段有丢包或明显偏慢，红色满格表示完全不通。
+ * 柱高对应延迟，底色按该探测目标的阈值配色；丢包优先标红。
  */
-export function LatencyStrip({ data, max = 72 }: { data: ProbePoint[]; max?: number }) {
+export function LatencyStrip({
+  data,
+  max = 72,
+  bands = DEFAULT_BANDS,
+}: {
+  data: ProbePoint[];
+  max?: number;
+  /** 该探测目标生效的阈值配色 */
+  bands?: LatencyBand[];
+}) {
   const rows = data.slice(-max);
   if (rows.length === 0) return null;
-  const { avg, max: peak } = probeStats(rows);
+  const { max: peak } = probeStats(rows);
   return (
     <div className="flex h-8 items-end gap-px" aria-hidden>
       {rows.map((p) => {
         const loss = lossOf(p);
         const ms = p.latency_ms;
         const h = ms == null ? 100 : Math.max(12, (ms / (peak || 1)) * 100);
-        const slow = ms != null && avg != null && ms > avg * 2;
-        const tone = loss >= 1 ? "bg-red-500/80" : loss > 0 || slow ? "bg-amber-500/80" : "bg-emerald-500/70";
+        // 丢包比“慢”更严重，先按丢包上色；其余交给阈值配色
+        const tone = loss >= 1 ? "bg-red-500/80" : loss > 0 ? "bg-amber-500/80" : null;
+        const color = latencyColor(bands, ms);
         const detail = loss >= 1 ? "丢包" : loss > 0 ? `丢包 ${(loss * 100).toFixed(0)}%` : "";
         return (
           <div
             key={p.ts}
-            className={cn("min-w-[2px] flex-1 rounded-sm", tone)}
-            style={{ height: `${h}%` }}
+            className={cn("min-w-[2px] flex-1 rounded-sm", tone ?? "bg-muted")}
+            // 配色色块留一点透明，条带不至于太扎眼
+            style={{ height: `${h}%`, background: tone ? undefined : (color ?? undefined) }}
             title={`${fmtTime(p.ts)} · ${fmtLatency(ms)}${detail ? ` · ${detail}` : ""}`}
           />
         );
@@ -326,17 +369,35 @@ export function LatencyStrip({ data, max = 72 }: { data: ProbePoint[]; max?: num
     </div>
   );
 }
+/** 背景带够高就行；配 ifOverflow=hidden 裁剪，不会把 Y 轴撑大。 */
+const BAND_TOP = 1_000_000;
+
+/** 分段配色 → 背景带的 [下界, 上界)。最后一段没有上限，给一个足够大的值。 */
+function bandAreas(bands: LatencyBand[]): { from: number; to: number; color: string }[] {
+  const list = resolveBands(bands);
+  let from = 0;
+  return list.map((b) => {
+    const to = b.max_ms ?? BAND_TOP;
+    const area = { from, to, color: b.color };
+    from = to;
+    return area;
+  });
+}
+
 /** 探测延迟折线：丢包处画红色色块并断开曲线，可切换平滑；聚合数据带峰值虚线。 */
 export function ProbeChart({
   data,
   height = 200,
   smooth = false,
   spanMs = 0,
+  bands = DEFAULT_BANDS,
 }: {
   data: ProbePoint[];
   height?: number;
   smooth?: boolean;
   spanMs?: number;
+  /** 阈值配色画成背景带；曲线保持中性色，颜色语义不打架 */
+  bands?: LatencyBand[];
 }) {
   if (!data.length) return <EmptyChart />;
   const rows = data.map((p) => ({
@@ -370,6 +431,20 @@ export function ProbeChart({
             tickLine={false}
             axisLine={false}
           />
+          {/* 阈值配色画成背景带：ifOverflow=hidden 只裁剪不改 Y 轴范围；zIndex 压到网格线之下 */}
+          {bandAreas(bands).map((b) => (
+            <ReferenceArea
+              key={b.from}
+              yAxisId="ms"
+              y1={b.from}
+              y2={b.to}
+              fill={b.color}
+              fillOpacity={0.1}
+              stroke="none"
+              ifOverflow="hidden"
+              zIndex={-150}
+            />
+          ))}
           {/* 丢包比例用色块标出，与延迟共用一张图 */}
           <YAxis yAxisId="loss" domain={[0, 1]} hide />
           <Tooltip
@@ -452,6 +527,8 @@ export interface LatencySeries {
   key: string;
   label: string;
   color: string;
+  /** 色序循环到第二轮以后用虚线区分，取自 seriesDash */
+  dash?: string;
   rows: ProbePoint[];
 }
 
@@ -498,19 +575,22 @@ function resample(series: LatencySeries[], from: number, to: number, buckets: nu
   return out;
 }
 
-/** 多线路对比：一张图看这台机器到各个目标的延迟。 */
+/** 多线路对比：一张图看多条延迟曲线（一台机器 × 多目标，或一个目标 × 多机器）。 */
 export function LatencyMultiChart({
   series,
   from,
   to,
   buckets = 160,
   height = 220,
+  smooth = true,
 }: {
   series: LatencySeries[];
   from: number;
   to: number;
   buckets?: number;
   height?: number;
+  /** 页面级对比图一直是平滑的；延迟面板里跟随「平滑」开关 */
+  smooth?: boolean;
 }) {
   const rows = useMemo(() => resample(series, from, to, buckets), [series, from, to, buckets]);
   if (rows.length === 0) return <EmptyChart />;
@@ -577,9 +657,10 @@ export function LatencyMultiChart({
             <Line
               key={s.key}
               yAxisId="ms"
-              type="monotone"
+              type={smooth ? "monotone" : "linear"}
               dataKey={s.key}
               stroke={s.color}
+              strokeDasharray={s.dash}
               strokeWidth={1.6}
               dot={false}
               connectNulls={false}

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { Activity, Cpu, HardDrive, MemoryStick, Waypoints } from "lucide-react";
+import { Activity, ArrowDownUp, Cpu, HardDrive, MemoryStick, Waypoints } from "lucide-react";
 
 import { Flag } from "@/components/flag";
 import { LatencyPanel } from "@/components/latency-panel";
@@ -16,9 +16,10 @@ import {
   NET_SERIES,
   type RangeKey,
   RangeTabs,
-  SERIES_COLORS,
   USAGE_SERIES,
   probeStats,
+  seriesColor,
+  seriesDash,
   toChartRows,
 } from "@/components/metric-chart";
 import { PublicHeader } from "@/components/public-header";
@@ -28,6 +29,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, usePublicEvents } from "@/lib/hooks";
+import { latencyColor } from "@/lib/latency";
+import { modeLabel, resetText, trafficText, withLiveUsed } from "@/lib/traffic";
 import type { MetricPoint, ProbeItem, ProbePoint, PublicOverview } from "@/lib/types";
 import { fmtBytes, fmtLatency, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
 
@@ -52,6 +55,8 @@ export default function PublicServerPage() {
   );
 
   const [liveM, setLiveM] = useState<MetricPoint | null>(null);
+  // 实时事件里的已用流量（0 表示这条事件没带，沿用快照）
+  const [liveUsed, setLiveUsed] = useState(0);
   const [liveOnline, setLiveOnline] = useState<boolean | null>(null);
   const [openProbe, setOpenProbe] = useState<number | null>(null);
 
@@ -70,6 +75,7 @@ export default function PublicServerPage() {
         uptime: e.uptime,
       };
       setLiveM(p);
+      setLiveUsed(e.traffic_used);
       setLiveOnline(true);
       history.setData((rows) => [...(rows ?? []), p].slice(-1000));
     } else if (e.type === "server_status" && e.id === id) {
@@ -99,7 +105,8 @@ export default function PublicServerPage() {
       probes.map((p, i) => ({
         key: `p${p.id}`,
         label: p.name,
-        color: SERIES_COLORS[i % SERIES_COLORS.length],
+        color: seriesColor(i),
+        dash: seriesDash(i),
         rows: histories.data?.rows[i] ?? [],
       })),
     [probes, histories.data],
@@ -119,6 +126,8 @@ export default function PublicServerPage() {
   const online = liveOnline ?? srv.online;
   const m = online ? (liveM ?? srv.latest) : null;
   const rows = toChartRows(history.data);
+  const traffic = withLiveUsed(srv.traffic, liveUsed);
+  const trafficPct = traffic.pct;
 
   return (
     <div className="min-h-screen bg-muted/30">
@@ -137,7 +146,7 @@ export default function PublicServerPage() {
       </PublicHeader>
 
       <main className="mx-auto w-full max-w-6xl space-y-5 p-4 md:p-6">
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <StatTile
             label="CPU"
             value={m ? fmtPct(m.cpu) : "—"}
@@ -162,6 +171,25 @@ export default function PublicServerPage() {
             value={m ? `↓ ${fmtBytes(m.net_in)}/s` : "—"}
             hint={m ? `↑ ${fmtBytes(m.net_out)}/s` : "等待上报"}
             icon={<Activity className="size-4" />}
+          />
+          <StatTile
+            label="本周期流量"
+            value={trafficPct == null ? fmtBytes(traffic.used) : fmtPct(trafficPct)}
+            hint={
+              trafficPct == null
+                ? `不限额 · ${modeLabel(traffic.mode)}`
+                : `${trafficText(traffic)} · ${resetText(traffic)}`
+            }
+            icon={<ArrowDownUp className="size-4" />}
+            tone={
+              trafficPct == null
+                ? "default"
+                : trafficPct >= 100
+                  ? "danger"
+                  : trafficPct >= 80
+                    ? "warning"
+                    : "default"
+            }
           />
         </div>
 
@@ -218,7 +246,7 @@ export default function PublicServerPage() {
                       key={p.id}
                       probe={p}
                       serverId={id}
-                      color={SERIES_COLORS[i % SERIES_COLORS.length]}
+                      color={seriesColor(i)}
                       rows={histories.data?.rows[i] ?? []}
                       span={cfg}
                       open={openProbe === p.id}
@@ -277,7 +305,9 @@ function ProbeRow({
           <Cell label="当前">
             {st.last ? (
               st.last.ok ? (
-                fmtLatency(st.last.latency_ms)
+                <span style={{ color: latencyColor(probe.bands, st.last.latency_ms) ?? undefined }}>
+                  {fmtLatency(st.last.latency_ms)}
+                </span>
               ) : (
                 <span className="text-red-600 dark:text-red-400">丢包</span>
               )
@@ -285,7 +315,11 @@ function ProbeRow({
               "—"
             )}
           </Cell>
-          <Cell label="平均">{fmtLatency(st.avg)}</Cell>
+          <Cell label="平均">
+            <span style={{ color: latencyColor(probe.bands, st.avg) ?? undefined }}>
+              {fmtLatency(st.avg)}
+            </span>
+          </Cell>
           <Cell label="抖动">{st.jitter == null ? "—" : `±${Math.round(st.jitter)} ms`}</Cell>
           <Cell label="丢包">{st.count === 0 ? "—" : `${(st.loss * 100).toFixed(1)}%`}</Cell>
           <Cell label="24h 可用">
@@ -301,6 +335,7 @@ function ProbeRow({
             load={api.publicProbeHistory}
             lockedServerId={serverId}
             span={span}
+            bands={probe.bands}
             height={180}
           />
         </div>

@@ -19,19 +19,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { COUNTRIES } from "@/lib/countries";
-import { RENEW_CYCLE_LABELS, type RenewCycle, type Server } from "@/lib/types";
+import { TRAFFIC_UNITS, type TrafficUnit, splitLimit, toBytes } from "@/lib/traffic";
+import {
+  RENEW_CYCLE_LABELS,
+  TRAFFIC_MODE_LABELS,
+  type RenewCycle,
+  type Server,
+  type ServerInput,
+  type TrafficMode,
+} from "@/lib/types";
 import { dateAfter } from "@/lib/utils";
 
-export interface ServerFormValue {
-  name: string;
-  country: string;
-  note: string;
-  enabled: boolean;
-  expire_date: string | null;
-  renew_price: number;
-  renew_cycle: RenewCycle;
-  report_interval_s: number;
-}
+/** 表单值就是后端的请求体，流量三个字段一并提交。 */
+export type ServerFormValue = ServerInput;
 
 function initial(server?: Server | null): ServerFormValue {
   return {
@@ -43,6 +43,9 @@ function initial(server?: Server | null): ServerFormValue {
     renew_price: server?.renew_price ?? 0,
     renew_cycle: server?.renew_cycle ?? "month",
     report_interval_s: server?.report_interval_s ?? 5,
+    traffic_limit_bytes: server?.traffic.limit ?? 0,
+    traffic_mode: server?.traffic.mode ?? "sum",
+    traffic_reset_day: server?.traffic.reset_day ?? 1,
   };
 }
 
@@ -56,16 +59,26 @@ interface Props {
 
 export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props) {
   const [v, setV] = useState<ServerFormValue>(() => initial(server));
+  // 限额在表单里按 GB/TB 输入，提交前折算成字节
+  const [limit, setLimit] = useState(() => splitLimit(server?.traffic.limit ?? 0));
   const [saving, setSaving] = useState(false);
   const editing = !!server;
 
   // 每次打开时同步为最新值
   useEffect(() => {
-    if (open) setV(initial(server));
+    if (open) {
+      setV(initial(server));
+      setLimit(splitLimit(server?.traffic.limit ?? 0));
+    }
   }, [open, server]);
 
   const set = <K extends keyof ServerFormValue>(k: K, val: ServerFormValue[K]) =>
     setV((s) => ({ ...s, [k]: val }));
+
+  const setLimitFields = (value: number, unit: TrafficUnit) => {
+    setLimit({ value, unit });
+    set("traffic_limit_bytes", toBytes(value, unit));
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -75,6 +88,15 @@ export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props
     }
     if (v.report_interval_s < 1 || v.report_interval_s > 3600) {
       toast.error("上报间隔需在 1-3600 秒之间");
+      return;
+    }
+    if (v.traffic_limit_bytes > 0 && v.traffic_limit_bytes < 1024 * 1024) {
+      toast.error("流量限额太小，请至少设置 1 MB");
+      return;
+    }
+    // 29-31 号并非每月都有，主控只接受 1-28
+    if (v.traffic_reset_day < 0 || v.traffic_reset_day > 28) {
+      toast.error("流量重置日需在 1-28 之间，填 0 表示不重置");
       return;
     }
     setSaving(true);
@@ -213,6 +235,74 @@ export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props
                 <span className="text-sm text-muted-foreground">
                   {v.enabled ? "允许该 Agent 连接上报" : "已停用，Agent 将被拒绝"}
                 </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3 rounded-md border p-3">
+            <p className="text-xs font-medium text-muted-foreground">流量套餐</p>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="sf-traffic-limit">周期限额</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="sf-traffic-limit"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    placeholder="不限制"
+                    value={limit.value || ""}
+                    onChange={(e) => setLimitFields(Number(e.target.value) || 0, limit.unit)}
+                  />
+                  <Select
+                    value={limit.unit}
+                    onValueChange={(u) => setLimitFields(limit.value, u as TrafficUnit)}
+                  >
+                    <SelectTrigger className="w-[76px] shrink-0" aria-label="限额单位">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TRAFFIC_UNITS.map((u) => (
+                        <SelectItem key={u.key} value={u.key}>
+                          {u.key}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <p className="text-[11px] text-muted-foreground">留空或 0 表示不限流量</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="sf-traffic-mode">计费口径</Label>
+                <Select value={v.traffic_mode} onValueChange={(m) => set("traffic_mode", m as TrafficMode)}>
+                  <SelectTrigger id="sf-traffic-mode">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(Object.keys(TRAFFIC_MODE_LABELS) as TrafficMode[]).map((m) => (
+                      <SelectItem key={m} value={m}>
+                        {TRAFFIC_MODE_LABELS[m]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">按服务商的计量方式选择</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="sf-traffic-day">重置日</Label>
+                <Input
+                  id="sf-traffic-day"
+                  type="number"
+                  min={0}
+                  max={28}
+                  step={1}
+                  placeholder="1"
+                  value={v.traffic_reset_day}
+                  onChange={(e) => set("traffic_reset_day", Math.trunc(Number(e.target.value)) || 0)}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  每月几号（1-28）按 UTC 归零，填 0 表示不重置
+                </p>
               </div>
             </div>
           </div>

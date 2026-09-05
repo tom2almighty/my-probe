@@ -160,6 +160,17 @@ export default function AlertsPage() {
                 max={100}
               />
               <RuleRow
+                title="流量用量"
+                desc="本周期已用流量占限额的比例超过阈值时通知，不限额的机器不参与"
+                enabled={rules.traffic_enabled}
+                onEnabled={(v) => setRule("traffic_enabled", v)}
+                value={rules.traffic_threshold_pct}
+                onValue={(v) => setRule("traffic_threshold_pct", v)}
+                unit="%"
+                min={1}
+                max={100}
+              />
+              <RuleRow
                 title="探测延迟"
                 desc="探测成功但延迟超过阈值时通知"
                 enabled={rules.latency_enabled}

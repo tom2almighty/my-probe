@@ -2,6 +2,39 @@
 
 export type RenewCycle = "month" | "quarter" | "half_year" | "year" | "none";
 
+/** 流量计费口径。 */
+export type TrafficMode = "up" | "down" | "sum" | "max";
+
+/** 一台机器本周期的流量用量与限额。 */
+export interface Traffic {
+  /** 本周期下行累计（字节） */
+  rx: number;
+  /** 本周期上行累计（字节） */
+  tx: number;
+  /** 按计费口径折算的已用量 */
+  used: number;
+  /** 周期限额（字节），0 = 不限制 */
+  limit: number;
+  mode: TrafficMode;
+  /** 每月重置日 1-28，0 = 不重置 */
+  reset_day: number;
+  /** 已用百分比；未设限额时为 null */
+  pct: number | null;
+  /** 当前周期起点（unix 毫秒），0 = 不分周期 */
+  cycle_start: number;
+  /** 下次重置时刻（unix 毫秒），不重置时为 null */
+  next_reset: number | null;
+}
+
+/** 一个已结束的计费周期。 */
+export interface TrafficCycle {
+  cycle_start: number;
+  rx: number;
+  tx: number;
+  /** 按当前计费口径折算的用量 */
+  used: number;
+}
+
 export interface Server {
   id: number;
   name: string;
@@ -19,8 +52,27 @@ export interface Server {
   secret_preview: string;
   /** Agent 上报的自身版本，从未连接过时为 null */
   agent_version: string | null;
+  /** 本周期流量用量与限额 */
+  traffic: Traffic;
   /** 最新一次上报的整机指标 */
   latest: MetricPoint | null;
+}
+
+/** 新建 / 编辑服务器的请求体（对应后端 ServerReq）。 */
+export interface ServerInput {
+  name: string;
+  country: string;
+  note: string;
+  enabled: boolean;
+  expire_date: string | null;
+  renew_price: number;
+  renew_cycle: RenewCycle;
+  report_interval_s: number;
+  /** 周期流量限额（字节），0 = 不限制 */
+  traffic_limit_bytes: number;
+  traffic_mode: TrafficMode;
+  /** 每月重置日 1-28，0 = 不重置 */
+  traffic_reset_day: number;
 }
 
 export interface CreateServerResp extends Server {
@@ -28,6 +80,13 @@ export interface CreateServerResp extends Server {
 }
 
 export type Protocol = "tcp" | "icmp";
+
+/** 延迟配色的一段：`max_ms` 为该段上限（含），最后一段省略表示无上限。 */
+export interface LatencyBand {
+  max_ms?: number | null;
+  /** 6 位 hex，如 #22c55e */
+  color: string;
+}
 
 export interface Probe {
   id: number;
@@ -38,9 +97,13 @@ export interface Probe {
   timeout_ms: number;
   interval_s: number;
   enabled: boolean;
+  /** 该目标自定义的配色；null = 跟随全局默认 */
+  latency_bands: LatencyBand[] | null;
 }
 
 export interface ProbeView extends Probe {
+  /** 生效配色（后端已回退过全局默认） */
+  bands: LatencyBand[];
   last: ProbePoint | null;
   ok_24h: number | null;
   avg_latency_ms: number | null;
@@ -50,6 +113,8 @@ export interface ProbeView extends Probe {
 export interface ProbeTargetStat {
   server_id: number;
   server_name: string;
+  /** 两位国家码，可能为空串 */
+  country: string;
   online: boolean;
   last: ProbePoint | null;
   ok_24h: number | null;
@@ -58,6 +123,8 @@ export interface ProbeTargetStat {
 
 /** 探测列表条目：探测本身 + 指派的客户端。 */
 export interface ProbeItem extends Probe {
+  /** 生效配色（后端已回退过全局默认） */
+  bands: LatencyBand[];
   server_ids: number[];
   targets: ProbeTargetStat[];
 }
@@ -72,10 +139,14 @@ export interface ProbeInput {
   interval_s: number;
   enabled: boolean;
   server_ids: number[];
+  /** null = 跟随全局默认配色 */
+  latency_bands: LatencyBand[] | null;
 }
 
 export interface ServerDetail extends Server {
   probes: ProbeView[];
+  /** 已归档的历史计费周期，最近的在前 */
+  traffic_history: TrafficCycle[];
 }
 
 /** 公开视图里的服务器（无密钥与资产信息）。 */
@@ -85,6 +156,7 @@ export interface PublicServer {
   country: string;
   online: boolean;
   last_seen: number;
+  traffic: Traffic;
   latest: MetricPoint | null;
 }
 
@@ -150,12 +222,15 @@ export interface AlertRules {
   disk_threshold: number;
   latency_threshold_ms: number;
   expire_days: number;
+  /** 本周期已用流量占限额的百分比阈值 */
+  traffic_threshold_pct: number;
   cpu_enabled: boolean;
   mem_enabled: boolean;
   disk_enabled: boolean;
   latency_enabled: boolean;
   offline_enabled: boolean;
   expire_enabled: boolean;
+  traffic_enabled: boolean;
 }
 
 export interface NotifierConfig {
@@ -182,6 +257,8 @@ export type UiEvent =
       net_out: number;
       load1: number;
       uptime: number;
+      /** 本周期已用流量（已按计费口径折算）；老 Agent 不上报累计值时为 0 */
+      traffic_used: number;
     }
   | { type: "probe"; probe_id: number; server_id: number; ts: number; ok: boolean; latency_ms: number | null }
   | { type: "servers_changed" };
@@ -198,14 +275,23 @@ export function defaultAlertRules(): AlertRules {
     disk_threshold: 90,
     latency_threshold_ms: 500,
     expire_days: 7,
+    traffic_threshold_pct: 80,
     cpu_enabled: false,
     mem_enabled: false,
     disk_enabled: false,
     latency_enabled: false,
     offline_enabled: true,
     expire_enabled: true,
+    traffic_enabled: false,
   };
 }
+
+export const TRAFFIC_MODE_LABELS: Record<TrafficMode, string> = {
+  up: "仅上传",
+  down: "仅下载",
+  sum: "上传 + 下载",
+  max: "上下行取大",
+};
 
 export const RENEW_CYCLE_LABELS: Record<RenewCycle, string> = {
   month: "按月",

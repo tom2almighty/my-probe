@@ -29,12 +29,20 @@ pub struct PublicOverview {
 pub async fn overview(State(st): State<AppState>) -> ApiResult<Arc<PublicOverview>> {
     // 组装总览要为每个 (探测, 机器) 组合查两次库，热点页面缓存几秒。
     let data = st.public_cache.overview.get_or_insert(String::new(), || {
+        let traffic = st.db.all_traffic();
         let servers: Vec<PublicServerView> = st
             .db
             .list_servers()
             .iter()
             .filter(|s| s.enabled)
-            .map(|s| public_server_view(s, is_server_online(&st, s.id), latest_metric(&st, s.id)))
+            .map(|s| {
+                public_server_view(
+                    s,
+                    is_server_online(&st, s.id),
+                    latest_metric(&st, s.id),
+                    &traffic.get(&s.id).copied().unwrap_or_default(),
+                )
+            })
             .collect();
         let online = servers.iter().filter(|s| s.online).count();
         PublicOverview {

@@ -94,6 +94,15 @@ pub struct MetricsSample {
     /// 网卡总上行/下行速率，单位 bytes/s。
     pub net_in_rate: u64,
     pub net_out_rate: u64,
+    /// 计入统计的网卡累计收发字节数。
+    ///
+    /// sysinfo 只承诺这是「累计值」，没说清起点是开机还是 `Networks` 实例创建，
+    /// 所以主控只取相邻两次上报的差值，不依赖绝对语义。
+    /// 老 Agent 不发这两个字段，`serde(default)` 保证新主控仍能解析。
+    #[serde(default)]
+    pub net_rx_total: u64,
+    #[serde(default)]
+    pub net_tx_total: u64,
     pub load_one: f64,
     pub load_five: f64,
     pub load_fifteen: f64,

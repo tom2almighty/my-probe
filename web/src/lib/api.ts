@@ -1,5 +1,6 @@
 //! API 客户端。前端带 `?mock` 或 VITE_MOCK=1 时走本地 mock，无需后端。
 
+import { DEFAULT_BANDS, resolveBands } from "./latency";
 import {
   type MockProbe,
   type MockServer,
@@ -11,11 +12,14 @@ import {
   mockProbes,
   mockServers,
   mockStatus,
+  mockTrafficCycles,
   subscribeMockEvents,
 } from "./mock";
+import { makeTraffic, usedBy } from "./traffic";
 import type {
   AlertRules,
   CreateServerResp,
+  LatencyBand,
   LoginResp,
   MetricPoint,
   NotifierConfig,
@@ -28,7 +32,9 @@ import type {
   PublicOverview,
   Server,
   ServerDetail,
+  ServerInput,
   StatusResp,
+  Traffic,
   UiEvent,
 } from "./types";
 
@@ -127,10 +133,12 @@ export interface ApiClient {
   status(): Promise<StatusResp>;
   servers(): Promise<Server[]>;
   server(id: number): Promise<ServerDetail>;
-  createServer(body: Partial<Server>): Promise<CreateServerResp>;
-  updateServer(id: number, body: Partial<Server>): Promise<void>;
+  createServer(body: ServerInput): Promise<CreateServerResp>;
+  updateServer(id: number, body: ServerInput): Promise<void>;
   deleteServer(id: number): Promise<void>;
   rotateSecret(id: number): Promise<{ secret: string }>;
+  /** 手动校正本周期流量；`usedBytes` 省略表示归零 */
+  resetTraffic(id: number, usedBytes?: number): Promise<{ traffic: Traffic }>;
   /** 该客户端当前执行的探测目标 */
   serverProbes(id: number): Promise<ProbeView[]>;
   /** 覆盖该客户端执行的探测目标 */
@@ -141,6 +149,9 @@ export interface ApiClient {
   deleteProbe(pid: number): Promise<void>;
   /** 覆盖执行该探测的客户端 */
   assignProbeServers(pid: number, serverIds: number[]): Promise<void>;
+  /** 全局默认延迟配色（未单独配置的探测目标都跟着它） */
+  latencyBands(): Promise<LatencyBand[]>;
+  saveLatencyBands(bands: LatencyBand[]): Promise<void>;
   metrics(id: number, sinceMs?: number, points?: number): Promise<MetricPoint[]>;
   probeHistory(pid: number, serverId: number | null, sinceMs: number, points?: number): Promise<ProbePoint[]>;
   alerts(): Promise<AlertRules>;
@@ -184,6 +195,11 @@ const realApi: ApiClient = {
     request(`/api/servers/${id}`, { method: "PUT", body: JSON.stringify(body) }).then(() => undefined),
   deleteServer: (id) => request(`/api/servers/${id}`, { method: "DELETE" }).then(() => undefined),
   rotateSecret: (id) => request(`/api/servers/${id}/rotate-secret`, { method: "POST" }),
+  resetTraffic: (id, usedBytes) =>
+    request(`/api/servers/${id}/traffic/reset`, {
+      method: "POST",
+      body: JSON.stringify({ used_bytes: usedBytes ?? null }),
+    }),
   serverProbes: (id) => request(`/api/servers/${id}/probes`),
   setServerProbes: (id, probeIds) =>
     request(`/api/servers/${id}/probes`, {
@@ -200,6 +216,9 @@ const realApi: ApiClient = {
       method: "PUT",
       body: JSON.stringify({ server_ids: serverIds }),
     }).then(() => undefined),
+  latencyBands: () => request("/api/latency-bands"),
+  saveLatencyBands: (bands) =>
+    request("/api/latency-bands", { method: "PUT", body: JSON.stringify(bands) }).then(() => undefined),
   metrics: (id, sinceMs, points) => request(`/api/servers/${id}/metrics${qs({ since_ms: sinceMs, points })}`),
   probeHistory: (pid, serverId, sinceMs, points) =>
     request(`/api/probes/${pid}/history${qs({ since_ms: sinceMs, points, server_id: serverId })}`),
@@ -225,6 +244,7 @@ const state = {
   alerts: structuredClone(mockAlertRules) as AlertRules,
   notifiers: structuredClone(mockNotifiers) as NotifierConfig[],
   status: structuredClone(mockStatus) as StatusResp,
+  bands: structuredClone(DEFAULT_BANDS) as LatencyBand[],
 };
 
 const mockDelay = <T>(v: T): Promise<T> => new Promise((resolve) => setTimeout(() => resolve(v), 120));
@@ -259,7 +279,13 @@ function probeFields(p: MockProbe): Probe {
     timeout_ms: p.timeout_ms,
     interval_s: p.interval_s,
     enabled: p.enabled,
+    latency_bands: p.latency_bands ? p.latency_bands.map((b) => ({ ...b })) : null,
   };
+}
+
+/** 主控在接口里就把全局默认回退好了，mock 也照做，前端不用再兜一次。 */
+function effectiveBands(p: MockProbe): LatencyBand[] {
+  return resolveBands(p.latency_bands, state.bands);
 }
 
 /** 只有预置样本有历史曲线，界面上新建的探测显示“暂无数据”。 */
@@ -275,14 +301,15 @@ function probeItem(p: MockProbe, publicOnly = false): ProbeItem {
     .map((s) => ({
       server_id: s.id,
       server_name: s.name,
+      country: s.country,
       online: s.online,
       ...statFor(p.id, s.id),
     }));
-  return { ...probeFields(p), server_ids: [...p.server_ids], targets };
+  return { ...probeFields(p), bands: effectiveBands(p), server_ids: [...p.server_ids], targets };
 }
 
 function probeViewFor(p: MockProbe, serverId: number): ProbeView {
-  return { ...probeFields(p), ...statFor(p.id, serverId) };
+  return { ...probeFields(p), bands: effectiveBands(p), ...statFor(p.id, serverId) };
 }
 
 function applyProbeInput(p: MockProbe, body: ProbeInput) {
@@ -294,6 +321,7 @@ function applyProbeInput(p: MockProbe, body: ProbeInput) {
   p.interval_s = body.interval_s;
   p.enabled = body.enabled;
   p.server_ids = [...body.server_ids];
+  p.latency_bands = body.latency_bands ? body.latency_bands.map((b) => ({ ...b })) : null;
 }
 
 const mockApi: ApiClient = {
@@ -312,27 +340,28 @@ const mockApi: ApiClient = {
     const s = state.servers.find((x) => x.id === id);
     if (!s) throw new Error("服务器不存在");
     const probes = state.probes.filter((p) => p.server_ids.includes(id)).map((p) => probeViewFor(p, id));
-    return mockDelay({ ...s, probes });
+    return mockDelay({ ...s, probes, traffic_history: mockTrafficCycles(s) });
   },
   async createServer(body) {
     await sleep(200);
     const id = Math.max(0, ...state.servers.map((s) => s.id)) + 1;
     const s: MockServer = {
       id,
-      name: body.name ?? "新服务器",
-      country: body.country ?? "",
-      note: body.note ?? "",
-      enabled: body.enabled ?? true,
-      expire_date: body.expire_date ?? null,
-      renew_price: body.renew_price ?? 0,
-      renew_cycle: body.renew_cycle ?? "month",
-      report_interval_s: body.report_interval_s ?? 5,
+      name: body.name,
+      country: body.country,
+      note: body.note,
+      enabled: body.enabled,
+      expire_date: body.expire_date,
+      renew_price: body.renew_price,
+      renew_cycle: body.renew_cycle,
+      report_interval_s: body.report_interval_s,
       created_at: new Date().toISOString(),
       last_seen: 0,
       online: false,
-      days_to_expire: daysTo(body.expire_date ?? null),
+      days_to_expire: daysTo(body.expire_date),
       secret_preview: "ab12****ef",
       agent_version: null, // 新建的机器还没连上来，版本要等 Agent 自报
+      traffic: planOf(body, 0, 0),
       latest: null,
       metrics: [],
     };
@@ -344,8 +373,26 @@ const mockApi: ApiClient = {
     await sleep(200);
     const s = state.servers.find((x) => x.id === id);
     if (!s) throw new Error("服务器不存在");
-    Object.assign(s, body, { days_to_expire: daysTo(body.expire_date ?? s.expire_date) });
+    Object.assign(s, body, {
+      days_to_expire: daysTo(body.expire_date),
+      // 限额 / 口径 / 重置日变了要按新设置重算，累计的收发字节不动
+      traffic: planOf(body, s.traffic.rx, s.traffic.tx),
+    });
     recountStatus();
+  },
+  async resetTraffic(id, usedBytes) {
+    await sleep(200);
+    const s = state.servers.find((x) => x.id === id);
+    if (!s) throw new Error("服务器不存在");
+    const t = s.traffic;
+    const target = usedBytes ?? 0;
+    // 和主控一致：按现有上下行比例缩放到目标总量，没有比例可依时全记在计费方向上
+    const k = t.used > 0 ? target / t.used : 0;
+    const rx = t.used > 0 ? Math.round(t.rx * k) : t.mode === "up" ? 0 : target;
+    const tx = t.used > 0 ? Math.round(t.tx * k) : t.mode === "up" ? target : 0;
+    const used = usedBy(t.mode, rx, tx);
+    s.traffic = { ...t, rx, tx, used, pct: t.limit > 0 ? (used / t.limit) * 100 : null };
+    return { traffic: s.traffic };
   },
   async deleteServer(id) {
     await sleep(200);
@@ -384,6 +431,7 @@ const mockApi: ApiClient = {
       server_ids: [...body.server_ids],
       base_latency_ms: 40,
       loss_rate: 0,
+      latency_bands: body.latency_bands ? body.latency_bands.map((b) => ({ ...b })) : null,
     };
     state.probes.push(p);
     recountStatus();
@@ -406,6 +454,11 @@ const mockApi: ApiClient = {
     const p = state.probes.find((x) => x.id === pid);
     if (!p) throw new Error("探测目标不存在");
     p.server_ids = [...serverIds];
+  },
+  latencyBands: async () => mockDelay(state.bands.map((b) => ({ ...b }))),
+  async saveLatencyBands(bands) {
+    await sleep(200);
+    state.bands = bands.map((b) => ({ ...b }));
   },
   metrics: async (id, sinceMs, points) => {
     // 只有预置节点有历史曲线，界面上新建的服务器显示“暂无数据”
@@ -445,6 +498,7 @@ const mockApi: ApiClient = {
         country: s.country,
         online: s.online,
         last_seen: s.last_seen,
+        traffic: s.traffic,
         latest: s.latest,
       }));
     return mockDelay({
@@ -469,6 +523,19 @@ const mockApi: ApiClient = {
     return mockDelay(mockProbeSeries(pid, sid, sinceMs, points));
   },
 };
+
+/** 表单里的三个流量字段 → 展示用的流量视图。 */
+function planOf(body: ServerInput, rx: number, tx: number): Traffic {
+  return makeTraffic(
+    {
+      limit_bytes: body.traffic_limit_bytes,
+      mode: body.traffic_mode,
+      reset_day: body.traffic_reset_day,
+    },
+    rx,
+    tx,
+  );
+}
 
 /** 到期天数（本地日期差） */
 function daysTo(date: string | null): number | null {

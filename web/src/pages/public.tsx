@@ -7,18 +7,21 @@ import { ChevronDown, ChevronRight, Waypoints } from "lucide-react";
 import { Flag } from "@/components/flag";
 import { LatencyPanel } from "@/components/latency-panel";
 import { PublicHeader } from "@/components/public-header";
-import { OnlineBadge, ProbeTargetChip, UsageBar } from "@/components/status";
+import { OnlineBadge, ProbeTargetChip, TrafficBar, UsageBar } from "@/components/status";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, usePublicEvents } from "@/lib/hooks";
-import type { MetricPoint, ProbeItem, PublicOverview, PublicServer } from "@/lib/types";
+import { withLiveUsed } from "@/lib/traffic";
+import type { MetricPoint, ProbeItem, PublicOverview, PublicServer, Traffic } from "@/lib/types";
 import { fmtBytes, fmtTime, pct, uptimeText } from "@/lib/utils";
 
 export default function PublicPage() {
   const { data, loading, reload, setData } = useAsync<PublicOverview>(() => api.publicOverview(), []);
   const [live, setLive] = useState<Record<number, MetricPoint>>({});
+  // 实时事件只带折算后的已用流量，rx/tx 仍取快照
+  const [liveUsed, setLiveUsed] = useState<Record<number, number>>({});
   const [onlineMap, setOnlineMap] = useState<Record<number, boolean>>({});
   const [openProbe, setOpenProbe] = useState<number | null>(null);
   const [showProbes, setShowProbes] = useState(true);
@@ -40,6 +43,7 @@ export default function PublicPage() {
           uptime: e.uptime,
         },
       }));
+      if (e.traffic_used) setLiveUsed((t) => ({ ...t, [e.server_id]: e.traffic_used }));
       setOnlineMap((m) => (m[e.server_id] ? m : { ...m, [e.server_id]: true }));
     } else if (e.type === "server_status") {
       setOnlineMap((m) => ({ ...m, [e.id]: e.online }));
@@ -73,9 +77,14 @@ export default function PublicPage() {
     () =>
       (data?.servers ?? []).map((s) => {
         const online = onlineMap[s.id] ?? s.online;
-        return { s, online, m: online ? (live[s.id] ?? s.latest) : null };
+        return {
+          s,
+          online,
+          m: online ? (live[s.id] ?? s.latest) : null,
+          traffic: withLiveUsed(s.traffic, liveUsed[s.id]),
+        };
       }),
-    [data?.servers, live, onlineMap],
+    [data?.servers, live, liveUsed, onlineMap],
   );
 
   const online = servers.filter((x) => x.online).length;
@@ -105,8 +114,8 @@ export default function PublicPage() {
             </Card>
           ) : (
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {servers.map(({ s, online: on, m }) => (
-                <ServerCard key={s.id} server={s} online={on} m={m} />
+              {servers.map(({ s, online: on, m, traffic }) => (
+                <ServerCard key={s.id} server={s} online={on} m={m} traffic={traffic} />
               ))}
             </div>
           )}
@@ -126,7 +135,7 @@ export default function PublicPage() {
             )}
             <h2 className="text-base font-semibold">线路对比</h2>
             <span className="text-xs text-muted-foreground">
-              {probes.length} 个目标 · 按目标横向比较各节点
+              {probes.length} 个目标 · 展开后可勾选多个节点同图对比
             </span>
           </button>
           {showProbes &&
@@ -160,7 +169,17 @@ export default function PublicPage() {
 }
 
 /** 节点卡片：整卡是通往 /s/:id 的链接，卡面只放一眼能看完的现状。 */
-function ServerCard({ server, online, m }: { server: PublicServer; online: boolean; m: MetricPoint | null }) {
+function ServerCard({
+  server,
+  online,
+  m,
+  traffic,
+}: {
+  server: PublicServer;
+  online: boolean;
+  m: MetricPoint | null;
+  traffic: Traffic;
+}) {
   return (
     <Card className="transition-colors hover:border-primary/40 hover:bg-accent/30">
       <Link
@@ -177,7 +196,7 @@ function ServerCard({ server, online, m }: { server: PublicServer; online: boole
             <OnlineBadge online={online} />
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2.5">
             <UsageBar label="CPU" pct={m ? m.cpu : null} />
             <UsageBar
               label="内存"
@@ -189,6 +208,7 @@ function ServerCard({ server, online, m }: { server: PublicServer; online: boole
               pct={m ? pct(m.disk_used, m.disk_total) : null}
               detail={m ? `${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}` : undefined}
             />
+            <TrafficBar traffic={traffic} />
           </div>
 
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5 text-[11px] text-muted-foreground">
@@ -244,14 +264,22 @@ function ProbeCard({ probe, open, onToggle }: { probe: ProbeItem; open: boolean;
         {probe.targets.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {probe.targets.map((t) => (
-              <ProbeTargetChip key={t.server_id} target={t} />
+              <ProbeTargetChip key={t.server_id} target={t} bands={probe.bands} />
             ))}
           </div>
         )}
 
         {open && (
-          <div className="border-t pt-3">
-            <LatencyPanel probeId={probe.id} targets={probe.targets} load={api.publicProbeHistory} />
+          <div className="space-y-2 border-t pt-3">
+            {probe.targets.length > 1 && (
+              <p className="text-[11px] text-muted-foreground">勾选多个节点可放在同一张图里对比线路</p>
+            )}
+            <LatencyPanel
+              probeId={probe.id}
+              targets={probe.targets}
+              load={api.publicProbeHistory}
+              bands={probe.bands}
+            />
           </div>
         )}
       </CardContent>

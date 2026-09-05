@@ -1,6 +1,6 @@
 //! 领域模型（数据库表映射 + REST DTO）。
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 /// 服务器（对应一台被探针 Agent 的机器）。
@@ -27,6 +27,8 @@ pub struct Server {
     pub last_seen: i64,
     /// Agent 在 Hello 里上报的自身版本，从未连接过则为 None。
     pub agent_version: Option<String>,
+    /// 流量限额设置。
+    pub traffic: TrafficPlan,
     pub online: bool,
 }
 
@@ -102,6 +104,192 @@ impl RenewCycle {
     }
 }
 
+/// 流量计费口径。各服务商算法不同，四种覆盖常见情况。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TrafficMode {
+    /// 仅上传。
+    Up,
+    /// 仅下载。
+    Down,
+    /// 上传 + 下载。
+    #[default]
+    Sum,
+    /// 上下行取较大值。
+    Max,
+}
+
+impl TrafficMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrafficMode::Up => "up",
+            TrafficMode::Down => "down",
+            TrafficMode::Sum => "sum",
+            TrafficMode::Max => "max",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "up" => TrafficMode::Up,
+            "down" => TrafficMode::Down,
+            "max" => TrafficMode::Max,
+            _ => TrafficMode::Sum,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            TrafficMode::Up => "仅上传",
+            TrafficMode::Down => "仅下载",
+            TrafficMode::Sum => "上传 + 下载",
+            TrafficMode::Max => "上下行取大",
+        }
+    }
+    /// 按口径把累计收发字节折算成「已用量」。rx = 下载，tx = 上传。
+    pub fn used(&self, rx: u64, tx: u64) -> u64 {
+        match self {
+            TrafficMode::Up => tx,
+            TrafficMode::Down => rx,
+            TrafficMode::Sum => rx.saturating_add(tx),
+            TrafficMode::Max => rx.max(tx),
+        }
+    }
+}
+
+/// 一台机器的流量限额设置。三个字段总是一起读写，打包传递。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrafficPlan {
+    /// 周期限额（字节），0 = 不限制。
+    pub limit_bytes: u64,
+    pub mode: TrafficMode,
+    /// 每月重置日 1-28，0 = 不重置。
+    pub reset_day: u32,
+}
+
+impl Default for TrafficPlan {
+    fn default() -> Self {
+        TrafficPlan {
+            limit_bytes: 0,
+            mode: TrafficMode::Sum,
+            reset_day: 1,
+        }
+    }
+}
+
+impl TrafficPlan {
+    /// 当前计费周期起点（unix 毫秒）。
+    ///
+    /// 取当月 `reset_day` 日 00:00 UTC；今天还没到那一天就退回上个月。
+    /// 时区固定 UTC，与每日任务（`alert.rs run_daily_tasks`）一致，界面上注明。
+    /// `reset_day == 0`（不重置）返回 0，表示「只累计、不分周期」。
+    pub fn cycle_start(&self, now: DateTime<Utc>) -> i64 {
+        if self.reset_day == 0 {
+            return 0;
+        }
+        let today = now.date_naive();
+        let this = day_in_month(today.year(), today.month(), self.reset_day);
+        let start = if today >= this {
+            this
+        } else {
+            let (y, m) = prev_month(today.year(), today.month());
+            day_in_month(y, m, self.reset_day)
+        };
+        midnight_ms(start)
+    }
+
+    /// 下一次重置的时刻（unix 毫秒）。不重置时为 None。
+    pub fn next_reset(&self, now: DateTime<Utc>) -> Option<i64> {
+        if self.reset_day == 0 {
+            return None;
+        }
+        let today = now.date_naive();
+        let this = day_in_month(today.year(), today.month(), self.reset_day);
+        let next = if today < this {
+            this
+        } else {
+            let (y, m) = next_month(today.year(), today.month());
+            day_in_month(y, m, self.reset_day)
+        };
+        Some(midnight_ms(next))
+    }
+}
+
+fn prev_month(y: i32, m: u32) -> (i32, u32) {
+    if m == 1 { (y - 1, 12) } else { (y, m - 1) }
+}
+
+fn next_month(y: i32, m: u32) -> (i32, u32) {
+    if m == 12 { (y + 1, 1) } else { (y, m + 1) }
+}
+
+/// 某月的第 `day` 天；该月没有这一天（如 2 月 30 日）则取当月最后一天。
+fn day_in_month(y: i32, m: u32, day: u32) -> NaiveDate {
+    let (ny, nm) = next_month(y, m);
+    let last = NaiveDate::from_ymd_opt(ny, nm, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(28);
+    NaiveDate::from_ymd_opt(y, m, day.clamp(1, last)).unwrap_or(NaiveDate::MIN)
+}
+
+fn midnight_ms(d: NaiveDate) -> i64 {
+    d.and_hms_opt(0, 0, 0)
+        .map(|t| t.and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// 当前计费周期的流量累计。
+///
+/// `last_rx` / `last_tx` 是上一次上报的累计读数，只用来做差分：Agent 的
+/// `total_*` 起点语义不明确（开机还是进程启动），所以主控只信相邻两次的差值。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrafficUsage {
+    /// 当前周期起点（unix 毫秒）。
+    pub cycle_start: i64,
+    pub rx: u64,
+    pub tx: u64,
+    pub last_rx: u64,
+    pub last_tx: u64,
+    pub updated_at: i64,
+}
+
+/// 一次流量累加的结果。`rolled` 表示这一笔跨过了周期边界（旧周期已归档、计数已归零），
+/// 调用方据此清掉流量告警的去重键。
+#[derive(Debug, Clone, Copy)]
+pub struct TrafficBump {
+    pub usage: TrafficUsage,
+    pub rolled: bool,
+}
+
+/// 延迟配色的一段。`max_ms` 为该段上限（含），最后一段省略它表示无上限。
+///
+/// 同一套断点对「同机房 5ms」和「跨洋 200ms」都不合适，所以配色跟着探测目标走：
+/// `probes.latency_bands` 为空时回退到 settings 里的全局默认。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencyBand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<u64>,
+    /// 6 位 hex 颜色，如 `#22c55e`。只收 hex，避免任意字符串进到前端 style。
+    pub color: String,
+}
+
+/// 全局默认配色：<100ms 绿 / 100-160ms 琥珀 / 更慢红。
+pub fn default_latency_bands() -> Vec<LatencyBand> {
+    vec![
+        LatencyBand {
+            max_ms: Some(100),
+            color: "#22c55e".into(),
+        },
+        LatencyBand {
+            max_ms: Some(160),
+            color: "#f59e0b".into(),
+        },
+        LatencyBand {
+            max_ms: None,
+            color: "#ef4444".into(),
+        },
+    ]
+}
+
 /// 探测目标。独立实体，通过 probe_assignments 指派给一到多个客户端执行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Probe {
@@ -113,6 +301,9 @@ pub struct Probe {
     pub timeout_ms: u64,
     pub interval_s: u64,
     pub enabled: bool,
+    /// 自定义延迟配色；None = 跟随全局默认。
+    #[serde(default)]
+    pub latency_bands: Option<Vec<LatencyBand>>,
 }
 
 /// 主控下发给 agent 的探测配置（去掉主控侧独有字段）。
@@ -184,6 +375,8 @@ pub struct AlertRules {
     pub latency_threshold_ms: u64,
     /// 到期前多少天提醒。
     pub expire_days: u64,
+    /// 周期流量用到限额的百分之多少时提醒（0-100）。每机限额在 servers 表上。
+    pub traffic_threshold_pct: f32,
     /// 聚合所有启用开关。
     pub cpu_enabled: bool,
     pub mem_enabled: bool,
@@ -191,6 +384,7 @@ pub struct AlertRules {
     pub latency_enabled: bool,
     pub offline_enabled: bool,
     pub expire_enabled: bool,
+    pub traffic_enabled: bool,
 }
 
 /// 通知渠道配置。type 目前为 telegram，接口与其他渠道通用。
@@ -213,12 +407,14 @@ impl Default for AlertRules {
             disk_threshold: 90.0,
             latency_threshold_ms: 500,
             expire_days: 7,
+            traffic_threshold_pct: 80.0,
             cpu_enabled: false,
             mem_enabled: false,
             disk_enabled: false,
             latency_enabled: false,
             offline_enabled: true,
             expire_enabled: true,
+            traffic_enabled: false,
         }
     }
 }

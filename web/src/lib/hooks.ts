@@ -85,6 +85,48 @@ export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): AsyncState<T
   return { data, loading, reload, setData };
 }
 
+/** 同一个 key 的所有使用处，切换时一起更新（公开页一屏有多个图表面板）。 */
+const flagListeners = new Map<string, Set<(v: boolean) => void>>();
+
+function readFlag(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw == null ? fallback : raw === "1";
+  } catch {
+    return fallback; // 隐私模式下读不到，用默认值
+  }
+}
+
+/** 存在 localStorage 的布尔偏好（图表平滑之类），刷新后保持。 */
+export function usePersistedFlag(key: string, fallback = false): [boolean, (v: boolean) => void] {
+  const [on, setOn] = useState(() => readFlag(key, fallback));
+
+  useEffect(() => {
+    const peers = flagListeners.get(key) ?? new Set<(v: boolean) => void>();
+    flagListeners.set(key, peers);
+    peers.add(setOn);
+    setOn(readFlag(key, fallback));
+    return () => {
+      peers.delete(setOn);
+      if (peers.size === 0) flagListeners.delete(key);
+    };
+  }, [key, fallback]);
+
+  const update = useCallback(
+    (v: boolean) => {
+      try {
+        localStorage.setItem(key, v ? "1" : "0");
+      } catch {
+        /* 写不进去只影响持久化，本次切换照常生效 */
+      }
+      for (const fn of flagListeners.get(key) ?? []) fn(v);
+    },
+    [key],
+  );
+
+  return [on, update];
+}
+
 /** 复制到剪贴板，带 2s 成功态。 */
 export function useCopy(): [boolean, (text: string) => void] {
   const [copied, setCopied] = useState(false);

@@ -4,8 +4,8 @@ use chrono::Timelike;
 use myprobe_shared::protocol::{MetricsSample, ProbeResult};
 use tokio::time::Duration;
 
-use crate::models::Server;
-use crate::state::{AlertAction, AppState};
+use crate::models::{Server, TrafficUsage};
+use crate::state::{AlertAction, AppState, clear_traffic_alerts};
 
 fn pct(used: u64, total: u64) -> f32 {
     if total == 0 {
@@ -171,6 +171,63 @@ pub async fn maybe_alert_probe(state: &AppState, srv: &Server, r: &ProbeResult) 
             )
             .await;
         }
+    }
+}
+
+/// 流量告警求值。阈值是全局的（和 CPU/内存/磁盘一致），限额按机器配。
+///
+/// 「快到量」和「已到量」是两件事，分两个去重键各发一条；周期重置由调用方
+/// 清键（`clear_traffic_alerts`），所以新周期能重新触发。
+pub async fn maybe_alert_traffic(state: &AppState, srv: &Server, u: &TrafficUsage, rolled: bool) {
+    let rules = state.db.get_alert_rules();
+    let limit = srv.traffic.limit_bytes;
+    if !rules.traffic_enabled || limit == 0 {
+        if rolled {
+            clear_traffic_alerts(state, srv.id);
+        }
+        return;
+    }
+
+    let used = srv.traffic.mode.used(u.rx, u.tx);
+    let ratio = pct(used, limit);
+    let th = rules.traffic_threshold_pct.clamp(1.0, 100.0);
+    let ts = timestamp(u.updated_at);
+    let detail = format!(
+        "服务器：{name}\n本周期已用 <code>{used}</code> / {limit}（{ratio:.1}%，计费口径 {mode}）\n时间：{ts}",
+        name = srv.name,
+        used = human_bytes(used),
+        limit = human_bytes(limit),
+        mode = srv.traffic.mode.label(),
+        ratio = ratio,
+        ts = ts,
+    );
+
+    match state
+        .alerts
+        .threshold(&format!("traffic:{}", srv.id), ratio >= th)
+    {
+        AlertAction::Fire => {
+            notify(
+                state,
+                "🚨 <b>流量即将用尽</b>",
+                &format!("{detail}\n阈值 {th:.0}%"),
+            )
+            .await
+        }
+        AlertAction::Recover => {
+            notify(state, "✅ <b>流量已回落</b>", &format!("{detail}\n阈值 {th:.0}%")).await
+        }
+        AlertAction::None => {}
+    }
+
+    // 到量单独发一条，且同一周期只发一次
+    if ratio >= 100.0 && state.alerts.once(&format!("traffic-full:{}", srv.id)) {
+        notify(state, "🛑 <b>流量已用完</b>", &detail).await;
+    }
+
+    // 归零那一笔求值完再清键：上面刚好把「已回落」发出去，之后新周期能重新触发
+    if rolled {
+        clear_traffic_alerts(state, srv.id);
     }
 }
 

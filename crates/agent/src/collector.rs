@@ -148,6 +148,8 @@ impl Collector {
 
         let mut rx: u64 = 0;
         let mut tx: u64 = 0;
+        let mut rx_total: u64 = 0;
+        let mut tx_total: u64 = 0;
         for (name, nd) in self.nets.list().iter() {
             if !iface_counted(name, self.net_allow.as_deref()) {
                 continue;
@@ -155,6 +157,9 @@ impl Collector {
             // received()/transmitted() 是"自上次刷新以来"的字节数，不是速率
             rx += nd.received();
             tx += nd.transmitted();
+            // total_* 是累计值，交给主控做差分累加（用来算周期流量）
+            rx_total += nd.total_received();
+            tx_total += nd.total_transmitted();
         }
         let net_in = (rx as f64 / elapsed).round() as u64;
         let net_out = (tx as f64 / elapsed).round() as u64;
@@ -174,6 +179,8 @@ impl Collector {
             disks: disk_samples,
             net_in_rate: net_in,
             net_out_rate: net_out,
+            net_rx_total: rx_total,
+            net_tx_total: tx_total,
             load_one: load.one,
             load_five: load.five,
             load_fifteen: load.fifteen,

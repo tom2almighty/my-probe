@@ -1,19 +1,25 @@
 //! Mock 数据：本地预览前端样式用（`?mock` 或 VITE_MOCK=1 时启用）。
 //! 合成样本是稳定的，覆盖在线/离线/临期/高负载/丢包等状态。
 
+import { makeTraffic, usedBy } from "./traffic";
 import type {
   AlertRules,
+  LatencyBand,
   MetricPoint,
   Probe,
   ProbePoint,
   RenewCycle,
   Server,
   StatusResp,
+  TrafficCycle,
+  TrafficMode,
   UiEvent,
 } from "./types";
 
 const now = Date.now();
 const HOUR = 3600_000;
+const GB = 1024 ** 3;
+const TB = 1024 ** 4;
 
 let rngState = 8888;
 /** 模块初始化用的线性同余随机数。 */
@@ -78,6 +84,19 @@ interface ServerCfg {
   cycle: RenewCycle;
   cpu: number;
   mem: number;
+  /** 流量套餐与本周期累计，覆盖限额 / 不限额 / 到量几种展示 */
+  traffic: TrafficCfg;
+}
+
+interface TrafficCfg {
+  /** 周期限额（字节），0 = 不限制 */
+  limit: number;
+  mode: TrafficMode;
+  /** 每月重置日 1-28，0 = 不重置 */
+  resetDay: number;
+  /** 本周期已累计的下行 / 上行 */
+  rx: number;
+  tx: number;
 }
 
 /** 各预置节点的基准占用，合成任意时间窗的曲线时用。 */
@@ -110,19 +129,86 @@ function makeServer(id: number, name: string, country: string, online: boolean, 
     days_to_expire: cfg.daysLeft,
     secret_preview: "ab12****ef",
     agent_version: mockAgentVersion(id),
+    traffic: makeTraffic(
+      { limit_bytes: cfg.traffic.limit, mode: cfg.traffic.mode, reset_day: cfg.traffic.resetDay },
+      cfg.traffic.rx,
+      cfg.traffic.tx,
+    ),
     latest: online ? metrics[metrics.length - 1] : null,
     metrics,
   };
 }
 
 export const mockServers: MockServer[] = [
-  makeServer(1, "东京主站", "jp", true, { daysLeft: 45, price: 99, cycle: "month", cpu: 34, mem: 0.46 }),
-  makeServer(2, "香港节点", "hk", true, { daysLeft: 3, price: 128, cycle: "quarter", cpu: 62, mem: 0.71 }),
-  makeServer(3, "新加坡", "sg", true, { daysLeft: 120, price: 159, cycle: "year", cpu: 18, mem: 0.28 }),
-  makeServer(4, "美西洛杉矶", "us", false, { daysLeft: -2, price: 88, cycle: "month", cpu: 12, mem: 0.2 }),
-  makeServer(5, "德国法兰克福", "de", true, { daysLeft: 210, price: 199, cycle: "year", cpu: 51, mem: 0.55 }),
-  makeServer(6, "韩国首尔", "kr", false, { daysLeft: 0, price: 77, cycle: "month", cpu: 22, mem: 0.35 }),
+  makeServer(1, "东京主站", "jp", true, {
+    daysLeft: 45,
+    price: 99,
+    cycle: "month",
+    cpu: 34,
+    mem: 0.46,
+    traffic: { limit: 2 * TB, mode: "sum", resetDay: 1, rx: 0.82 * TB, tx: 0.41 * TB },
+  }),
+  // 快到量：用来看告警阈值那条黄线
+  makeServer(2, "香港节点", "hk", true, {
+    daysLeft: 3,
+    price: 128,
+    cycle: "quarter",
+    cpu: 62,
+    mem: 0.71,
+    traffic: { limit: 1 * TB, mode: "max", resetDay: 5, rx: 0.94 * TB, tx: 0.36 * TB },
+  }),
+  // 不限流量：界面上不应该出现进度条
+  makeServer(3, "新加坡", "sg", true, {
+    daysLeft: 120,
+    price: 159,
+    cycle: "year",
+    cpu: 18,
+    mem: 0.28,
+    traffic: { limit: 0, mode: "sum", resetDay: 1, rx: 3.4 * TB, tx: 1.1 * TB },
+  }),
+  // 已超额，且按「仅上传」计费
+  makeServer(4, "美西洛杉矶", "us", false, {
+    daysLeft: -2,
+    price: 88,
+    cycle: "month",
+    cpu: 12,
+    mem: 0.2,
+    traffic: { limit: 500 * GB, mode: "up", resetDay: 10, rx: 120 * GB, tx: 521 * GB },
+  }),
+  makeServer(5, "德国法兰克福", "de", true, {
+    daysLeft: 210,
+    price: 199,
+    cycle: "year",
+    cpu: 51,
+    mem: 0.55,
+    traffic: { limit: 20 * TB, mode: "sum", resetDay: 15, rx: 2.1 * TB, tx: 1.02 * TB },
+  }),
+  // 不按周期重置（长期总量套餐）
+  makeServer(6, "韩国首尔", "kr", false, {
+    daysLeft: 0,
+    price: 77,
+    cycle: "month",
+    cpu: 22,
+    mem: 0.35,
+    traffic: { limit: 1 * TB, mode: "down", resetDay: 0, rx: 0.22 * TB, tx: 0.08 * TB },
+  }),
 ];
+
+/** 已归档的历史周期：从本周期起点逐月往前推，用量围绕当前值波动。 */
+export function mockTrafficCycles(s: MockServer, n = 6): TrafficCycle[] {
+  // 不分周期就没有归档；新建的机器还没跑满一个周期
+  if (!s.traffic.cycle_start || (!s.traffic.rx && !s.traffic.tx)) return [];
+  const rows: TrafficCycle[] = [];
+  for (let i = 1; i <= n; i++) {
+    const d = new Date(s.traffic.cycle_start);
+    d.setUTCMonth(d.getUTCMonth() - i);
+    const k = 0.55 + hashRnd(s.id, 91, i) * 0.85;
+    const rx = Math.round(s.traffic.rx * k);
+    const tx = Math.round(s.traffic.tx * k);
+    rows.push({ cycle_start: d.getTime(), rx, tx, used: usedBy(s.traffic.mode, rx, tx) });
+  }
+  return rows;
+}
 
 /**
  * 整机指标曲线：按请求的时间窗与点数合成，形状只取决于时间戳，反复拉取不跳变。
@@ -184,6 +270,7 @@ function makeProbe(
   baseLatency: number,
   lossRate: number,
   enabled = true,
+  bands: LatencyBand[] | null = null,
 ): MockProbe {
   return {
     id,
@@ -197,6 +284,7 @@ function makeProbe(
     server_ids: serverIds,
     base_latency_ms: baseLatency,
     loss_rate: lossRate,
+    latency_bands: bands,
   };
 }
 
@@ -205,7 +293,13 @@ export const mockProbes: MockProbe[] = [
   makeProbe(1, "主站 HTTPS", "www.example.com", "tcp", 443, [1, 2, 3, 5], 38, 0.004),
   makeProbe(2, "主站 ICMP", "www.example.com", "icmp", null, [1, 2, 3, 5, 6], 32, 0.05),
   makeProbe(3, "数据库", "10.0.0.5", "tcp", 3306, [1, 5], 11, 0),
-  makeProbe(4, "备用节点", "2001:db8::1", "tcp", 22, [3, 4], 96, 0.02),
+  // 跨洋链路本来就慢，单独放宽阈值：演示「按目标自定义配色」
+  makeProbe(4, "备用节点", "2001:db8::1", "tcp", 22, [3, 4], 96, 0.02, true, [
+    { max_ms: 140, color: "#22c55e" },
+    { max_ms: 260, color: "#3b82f6" },
+    { max_ms: 400, color: "#f59e0b" },
+    { color: "#ef4444" },
+  ]),
   makeProbe(5, "CDN 边缘", "cdn.example.com", "icmp", null, [2, 3], 19, 0.001),
   makeProbe(6, "旧监控入口", "old.example.com", "tcp", 80, [], 0, 0, false),
 ];
@@ -223,8 +317,10 @@ export function mockProbeSeries(
 ): ProbePoint[] {
   const p = mockProbes.find((x) => x.id === probeId);
   const srv = mockServers.find((s) => s.id === serverId);
-  const base = Math.max(4, (p?.base_latency_ms ?? 40) + (serverId % 4) * 7);
-  const loss = p?.loss_rate ?? 0;
+  // 每台机器一个稳定的基线倍率与丢包倍率：多节点同图对比时几条线不会叠在一起
+  const level = 0.65 + hashRnd(serverId, 7, 13) * 1.15;
+  const base = Math.max(4, ((p?.base_latency_ms ?? 40) + (serverId % 4) * 7) * level);
+  const loss = (p?.loss_rate ?? 0) * (0.3 + hashRnd(serverId, 3, 29) * 2.4);
   const end = Date.now();
   const cutoff = srv && !srv.online ? srv.last_seen : end;
   const span = Math.max(10 * 60_000, end - sinceMs);
@@ -294,12 +390,14 @@ export const mockAlertRules: AlertRules = {
   disk_threshold: 90,
   latency_threshold_ms: 300,
   expire_days: 7,
+  traffic_threshold_pct: 80,
   cpu_enabled: true,
   mem_enabled: true,
   disk_enabled: false,
   latency_enabled: true,
   offline_enabled: true,
   expire_enabled: true,
+  traffic_enabled: true,
 };
 
 export const mockNotifiers = [
@@ -337,6 +435,8 @@ export function subscribeMockEvents(onEvent: (e: UiEvent) => void): () => void {
         net_out: last.net_out,
         load1: last.load1,
         uptime: last.uptime + i * 5,
+        // 用量只增不减，能看出进度条在动
+        traffic_used: Math.round(srv.traffic.used + i * 3 * 1024 ** 2),
       });
     } else if (probes.length > 0) {
       const p = probes[i % probes.length];

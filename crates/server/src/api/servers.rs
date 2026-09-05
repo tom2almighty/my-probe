@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::probes::{ProbeView, probe_view};
 use crate::api::{ApiErr, ApiResult, internal};
-use crate::models::RenewCycle;
-use crate::state::{AppState, ServerView, is_server_online, latest_metric, server_view};
+use crate::models::{RenewCycle, TrafficMode, TrafficPlan};
+use crate::state::{
+    AppState, ServerView, clear_traffic_alerts, is_server_online, latest_metric, server_view, traffic_view,
+};
 use crate::ws;
 
 #[derive(Deserialize)]
@@ -28,6 +30,14 @@ pub struct ServerReq {
     pub renew_cycle: RenewCycle,
     #[serde(default = "default_interval")]
     pub report_interval_s: u64,
+    /// 周期流量限额（字节），0 / 不传 = 不限制。
+    #[serde(default)]
+    pub traffic_limit_bytes: u64,
+    #[serde(default)]
+    pub traffic_mode: TrafficMode,
+    /// 每月重置日 1-28，0 = 不重置。
+    #[serde(default = "default_reset_day")]
+    pub traffic_reset_day: u32,
 }
 
 fn default_true() -> bool {
@@ -35,6 +45,19 @@ fn default_true() -> bool {
 }
 fn default_interval() -> u64 {
     5
+}
+fn default_reset_day() -> u32 {
+    1
+}
+
+impl ServerReq {
+    fn plan(&self) -> TrafficPlan {
+        TrafficPlan {
+            limit_bytes: self.traffic_limit_bytes,
+            mode: self.traffic_mode,
+            reset_day: self.traffic_reset_day,
+        }
+    }
 }
 
 fn validate_server_req(r: &ServerReq) -> Result<(), String> {
@@ -52,6 +75,13 @@ fn validate_server_req(r: &ServerReq) -> Result<(), String> {
             return Err("到期日期格式应为 YYYY-MM-DD".into());
         }
     }
+    // 29-31 号并非每月都有，统一限制到 28，避免「这个月不重置」的意外
+    if r.traffic_reset_day > 28 {
+        return Err("流量重置日需在 1-28 之间，或填 0 表示不重置".into());
+    }
+    if r.traffic_limit_bytes > 0 && r.traffic_limit_bytes < 1024 * 1024 {
+        return Err("流量限额太小，请至少设置 1 MB".into());
+    }
     Ok(())
 }
 
@@ -64,11 +94,20 @@ fn gen_secret() -> String {
 
 /// 服务器列表（含在线状态）。
 pub async fn list(State(st): State<AppState>, _: crate::auth::AuthUser) -> ApiResult<Vec<ServerView>> {
+    // 流量一次查完，避免每台机器再来一条 SQL
+    let traffic = st.db.all_traffic();
     let views: Vec<ServerView> = st
         .db
         .list_servers()
         .iter()
-        .map(|s| server_view(s, is_server_online(&st, s.id), latest_metric(&st, s.id)))
+        .map(|s| {
+            server_view(
+                s,
+                is_server_online(&st, s.id),
+                latest_metric(&st, s.id),
+                &traffic.get(&s.id).copied().unwrap_or_default(),
+            )
+        })
         .collect();
     Ok(Json(views))
 }
@@ -100,6 +139,7 @@ pub async fn create(
             req.renew_price,
             req.renew_cycle,
             req.report_interval_s as i64,
+            req.plan(),
         )
         .map_err(|e| ApiErr::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     let srv = st
@@ -108,7 +148,7 @@ pub async fn create(
         .ok_or_else(|| ApiErr::new(StatusCode::NOT_FOUND, "创建失败"))?;
     st.ui_broadcast();
     Ok(Json(CreateResp {
-        view: server_view(&srv, false, None),
+        view: server_view(&srv, false, None, &Default::default()),
         secret,
     }))
 }
@@ -119,6 +159,18 @@ pub struct ServerDetail {
     #[serde(flatten)]
     pub server: ServerView,
     pub probes: Vec<ProbeView>,
+    /// 已归档的历史计费周期，最近的在前。
+    pub traffic_history: Vec<TrafficCycle>,
+}
+
+/// 一个已结束的计费周期。
+#[derive(Serialize)]
+pub struct TrafficCycle {
+    pub cycle_start: i64,
+    pub rx: u64,
+    pub tx: u64,
+    /// 按当前计费口径折算的用量。
+    pub used: u64,
 }
 
 pub async fn detail(
@@ -130,15 +182,32 @@ pub async fn detail(
         .db
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
+    let bands = st.db.get_latency_bands_default();
     let views: Vec<ProbeView> = st
         .db
         .probes_for_server(id)
         .iter()
-        .map(|p| probe_view(&st, p, id))
+        .map(|p| probe_view(&st, p, id, &bands))
         .collect();
     Ok(Json(ServerDetail {
-        server: server_view(&srv, is_server_online(&st, id), latest_metric(&st, id)),
+        server: server_view(
+            &srv,
+            is_server_online(&st, id),
+            latest_metric(&st, id),
+            &st.db.get_traffic(id),
+        ),
         probes: views,
+        traffic_history: st
+            .db
+            .traffic_cycles(id, 12)
+            .into_iter()
+            .map(|(cycle_start, rx, tx)| TrafficCycle {
+                cycle_start,
+                rx,
+                tx,
+                used: srv.traffic.mode.used(rx, tx),
+            })
+            .collect(),
     }))
 }
 
@@ -148,11 +217,12 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(req): Json<ServerReq>,
 ) -> ApiResult<serde_json::Value> {
-    let _srv = st
+    let srv = st
         .db
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
     validate_server_req(&req).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    let plan = req.plan();
     st.db
         .update_server(
             id,
@@ -164,12 +234,64 @@ pub async fn update(
             req.renew_price,
             req.renew_cycle,
             req.report_interval_s as i64,
+            plan,
         )
         .map_err(|e| ApiErr::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // 限额/口径变了，旧的告警去重状态不再有意义
+    if srv.traffic != plan {
+        clear_traffic_alerts(&st, id);
+    }
     st.ui_broadcast();
     // 间隔/开关变化需要重新下发配置
     ws::push_config(&st, id);
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 手动校正本周期流量。
+///
+/// Agent 离线期间的流量必然漏计，换机后累计读数也会错位；没有这个入口，
+/// 数字一旦偏了就永远偏着。`used_bytes` 省略表示直接归零。
+#[derive(Deserialize)]
+pub struct TrafficResetReq {
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+}
+
+pub async fn traffic_reset(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<TrafficResetReq>,
+) -> ApiResult<serde_json::Value> {
+    let srv = st
+        .db
+        .get_server(id)
+        .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
+    if let Some(used) = req.used_bytes {
+        if srv.traffic.limit_bytes > 0 && used > srv.traffic.limit_bytes.saturating_mul(100) {
+            return Err(ApiErr::new(
+                StatusCode::BAD_REQUEST,
+                "已用量明显超出限额，请检查数值",
+            ));
+        }
+    }
+    let cycle_start = srv.traffic.cycle_start(chrono::Utc::now());
+    let usage = st
+        .db
+        .reset_traffic(
+            id,
+            cycle_start,
+            req.used_bytes,
+            srv.traffic.mode,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(internal)?;
+    clear_traffic_alerts(&st, id);
+    st.ui_broadcast();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "traffic": traffic_view(&srv.traffic, &usage),
+    })))
 }
 
 pub async fn destroy(
@@ -214,11 +336,12 @@ pub async fn probes(
     st.db
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
+    let bands = st.db.get_latency_bands_default();
     let views: Vec<ProbeView> = st
         .db
         .probes_for_server(id)
         .iter()
-        .map(|p| probe_view(&st, p, id))
+        .map(|p| probe_view(&st, p, id, &bands))
         .collect();
     Ok(Json(views))
 }

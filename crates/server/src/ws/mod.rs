@@ -251,6 +251,32 @@ async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut Pe
         AgentToServer::Metrics(m) => {
             let disk_used: u64 = m.disks.iter().map(|d| d.used).sum();
             let disk_total: u64 = m.disks.iter().map(|d| d.total).sum();
+            let srv = st.db.get_server(server_id);
+
+            // 流量累计：历史曲线可以稀疏，用量不能丢，所以不走 metric_due 的节流。
+            // 老 Agent 不上报累计值（两个 0），跳过即可，别把基线写成 0。
+            let plan = srv.as_ref().map(|s| s.traffic);
+            let has_totals = m.net_rx_total > 0 || m.net_tx_total > 0;
+            let usage = match (plan, has_totals) {
+                (Some(plan), true) => {
+                    let cycle_start = plan.cycle_start(chrono::Utc::now());
+                    match st
+                        .db
+                        .bump_traffic(server_id, m.net_rx_total, m.net_tx_total, cycle_start, m.ts)
+                    {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            tracing::warn!("累计流量写入失败: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let traffic_used = match (plan, usage) {
+                (Some(plan), Some(b)) => plan.mode.used(b.usage.rx, b.usage.tx),
+                _ => 0,
+            };
 
             // 最新值进内存缓存，供列表首屏直接展示
             st.live.set(
@@ -286,6 +312,7 @@ async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut Pe
                 net_out: m.net_out_rate,
                 load1: m.load_one,
                 uptime: m.uptime_s,
+                traffic_used,
             });
 
             // 节流落盘 + 清理
@@ -303,10 +330,13 @@ async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut Pe
             }
 
             // 告警求值（不阻塞消息循环）
-            if let Some(srv) = st.db.get_server(server_id) {
+            if let Some(srv) = srv {
                 let st2 = st.clone();
                 tokio::spawn(async move {
                     alert::maybe_alert_metric(&st2, &srv, &m).await;
+                    if let Some(b) = usage {
+                        alert::maybe_alert_traffic(&st2, &srv, &b.usage, b.rolled).await;
+                    }
                 });
             }
         }

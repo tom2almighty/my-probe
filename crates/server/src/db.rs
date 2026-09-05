@@ -1,5 +1,6 @@
 //! SQLite 持久层。使用 rusqlite bundled，单文件、无外部依赖。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -7,7 +8,10 @@ use chrono::Utc;
 use myprobe_shared::protocol::{ProbeProtocol, ProbeResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::models::{AlertRules, MetricPoint, NotifierConfig, Probe, ProbePoint, RenewCycle, Server};
+use crate::models::{
+    AlertRules, LatencyBand, MetricPoint, NotifierConfig, Probe, ProbePoint, RenewCycle, Server, TrafficBump,
+    TrafficMode, TrafficPlan, TrafficUsage, default_latency_bands,
+};
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -32,7 +36,35 @@ CREATE TABLE IF NOT EXISTS servers (
     report_interval_s INTEGER NOT NULL DEFAULT 5,
     created_at   TEXT NOT NULL,
     last_seen    INTEGER NOT NULL DEFAULT 0,
-    agent_version TEXT
+    agent_version TEXT,
+    -- 月流量限额（字节），0 = 不限制
+    traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
+    -- 计费口径：up / down / sum / max
+    traffic_mode TEXT NOT NULL DEFAULT 'sum',
+    -- 每月重置日 1-28，0 = 不重置
+    traffic_reset_day INTEGER NOT NULL DEFAULT 1
+);
+
+-- 当前计费周期的流量累计。last_rx/last_tx 是上一次上报的累计读数，只用来做差分。
+CREATE TABLE IF NOT EXISTS traffic_usage (
+    server_id   INTEGER PRIMARY KEY,
+    cycle_start INTEGER NOT NULL DEFAULT 0,
+    rx          INTEGER NOT NULL DEFAULT 0,
+    tx          INTEGER NOT NULL DEFAULT 0,
+    last_rx     INTEGER NOT NULL DEFAULT 0,
+    last_tx     INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+);
+
+-- 归档：每次周期重置时把上一周期写进来，用来看「上个月用了多少」。
+CREATE TABLE IF NOT EXISTS traffic_history (
+    server_id   INTEGER NOT NULL,
+    cycle_start INTEGER NOT NULL,
+    rx          INTEGER NOT NULL DEFAULT 0,
+    tx          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(server_id, cycle_start),
+    FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
 );
 
 -- 探测目标独立于服务器：一个探测可以派给任意多个客户端执行。
@@ -45,7 +77,9 @@ CREATE TABLE IF NOT EXISTS probes (
     timeout_ms  INTEGER NOT NULL DEFAULT 5000,
     interval_s  INTEGER NOT NULL DEFAULT 60,
     enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- 延迟配色分段（JSON 数组）。NULL 表示跟随 settings.latency_bands_default
+    latency_bands TEXT
 );
 
 CREATE TABLE IF NOT EXISTS probe_assignments (
@@ -83,6 +117,11 @@ CREATE INDEX IF NOT EXISTS idx_probe_server_ts ON probe_results(server_id, ts);
 CREATE INDEX IF NOT EXISTS idx_probe_result_probe ON probe_results(probe_id, server_id, ts);
 "#;
 
+/// servers 的完整列清单。三处查询共用，列序与 `row_to_server` 的下标一一对应。
+const SERVER_COLS: &str = "id, name, secret, country, note, enabled, expire_date,
+     renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version,
+     traffic_limit_bytes, traffic_mode, traffic_reset_day";
+
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -99,6 +138,7 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         migrate_probes(&conn)?;
         migrate_servers(&conn)?;
+        migrate_probe_bands(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -151,6 +191,18 @@ impl Db {
         self.set_setting("alert_rules", &serde_json::to_string(rules).unwrap())
     }
 
+    /// 全局默认延迟配色。探测目标没单独配置时用它。
+    pub fn get_latency_bands_default(&self) -> Vec<LatencyBand> {
+        self.get_setting("latency_bands_default")
+            .and_then(|s| serde_json::from_str::<Vec<LatencyBand>>(&s).ok())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_latency_bands)
+    }
+
+    pub fn set_latency_bands_default(&self, bands: &[LatencyBand]) -> rusqlite::Result<()> {
+        self.set_setting("latency_bands_default", &serde_json::to_string(bands).unwrap())
+    }
+
     pub fn get_notifiers(&self) -> Vec<NotifierConfig> {
         self.get_setting("notifiers")
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -166,11 +218,7 @@ impl Db {
     pub fn list_servers(&self) -> Vec<Server> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
-            .prepare(
-                "SELECT id, name, secret, country, note, enabled, expire_date,
-                        renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
-                 FROM servers ORDER BY id",
-            )
+            .prepare(&format!("SELECT {SERVER_COLS} FROM servers ORDER BY id"))
             .unwrap();
         stmt.query_map([], row_to_server)
             .unwrap()
@@ -181,9 +229,7 @@ impl Db {
     pub fn get_server(&self, id: i64) -> Option<Server> {
         let c = self.conn.lock().unwrap();
         c.query_row(
-            "SELECT id, name, secret, country, note, enabled, expire_date,
-                    renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
-             FROM servers WHERE id = ?1",
+            &format!("SELECT {SERVER_COLS} FROM servers WHERE id = ?1"),
             params![id],
             row_to_server,
         )
@@ -195,9 +241,7 @@ impl Db {
     pub fn get_server_by_secret(&self, secret: &str) -> Option<Server> {
         let c = self.conn.lock().unwrap();
         c.query_row(
-            "SELECT id, name, secret, country, note, enabled, expire_date,
-                    renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
-             FROM servers WHERE secret = ?1",
+            &format!("SELECT {SERVER_COLS} FROM servers WHERE secret = ?1"),
             params![secret],
             row_to_server,
         )
@@ -206,7 +250,7 @@ impl Db {
         .flatten()
     }
 
-    // 建表字段逐个传入，比额外包一层 DTO 更直观
+    // 建表字段逐个传入，比额外包一层 DTO 更直观；流量三件套总是一起变，打包成 TrafficPlan
     #[allow(clippy::too_many_arguments)]
     pub fn create_server(
         &self,
@@ -218,11 +262,13 @@ impl Db {
         renew_price: f64,
         renew_cycle: RenewCycle,
         report_interval: i64,
+        traffic: TrafficPlan,
     ) -> rusqlite::Result<i64> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO servers(name, secret, country, note, expire_date, renew_price, renew_cycle, report_interval_s, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO servers(name, secret, country, note, expire_date, renew_price, renew_cycle, report_interval_s, created_at,
+                                 traffic_limit_bytes, traffic_mode, traffic_reset_day)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 name,
                 secret,
@@ -232,7 +278,10 @@ impl Db {
                 renew_price,
                 renew_cycle.as_str(),
                 report_interval,
-                Self::now_iso()
+                Self::now_iso(),
+                traffic.limit_bytes as i64,
+                traffic.mode.as_str(),
+                traffic.reset_day as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -250,12 +299,14 @@ impl Db {
         renew_price: f64,
         renew_cycle: RenewCycle,
         report_interval: i64,
+        traffic: TrafficPlan,
     ) -> rusqlite::Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
             "UPDATE servers SET name=?1, country=?2, note=?3, enabled=?4,
-                    expire_date=?5, renew_price=?6, renew_cycle=?7, report_interval_s=?8
-             WHERE id=?9",
+                    expire_date=?5, renew_price=?6, renew_cycle=?7, report_interval_s=?8,
+                    traffic_limit_bytes=?9, traffic_mode=?10, traffic_reset_day=?11
+             WHERE id=?12",
             params![
                 name,
                 country,
@@ -265,6 +316,9 @@ impl Db {
                 renew_price,
                 renew_cycle.as_str(),
                 report_interval,
+                traffic.limit_bytes as i64,
+                traffic.mode.as_str(),
+                traffic.reset_day as i64,
                 id
             ],
         )?;
@@ -297,6 +351,181 @@ impl Db {
         Ok(())
     }
 
+    // ---------- traffic ----------
+
+    /// 记一次上报带来的流量增量，返回落库后的当前周期用量。
+    ///
+    /// Agent 给的是累计读数，起点语义不确定，所以这里只信差值：
+    /// `delta = cur - last`；任一方向出现 `cur < last`（Agent 重启 / 机器重启 /
+    /// 计数回绕）就只把基线挪到新读数、这一轮不累加，避免把整个累计值当成增量。
+    /// 首次见到一台机器同样只建基线。`cycle_start` 变新则先归档旧周期再归零。
+    pub fn bump_traffic(
+        &self,
+        server_id: i64,
+        cur_rx: u64,
+        cur_tx: u64,
+        cycle_start: i64,
+        now: i64,
+    ) -> rusqlite::Result<TrafficBump> {
+        let mut c = self.conn.lock().unwrap();
+        let t = c.transaction()?;
+        let old = t
+            .query_row(
+                "SELECT cycle_start, rx, tx, last_rx, last_tx, updated_at FROM traffic_usage WHERE server_id=?1",
+                params![server_id],
+                row_to_traffic,
+            )
+            .optional()?;
+
+        let existed = old.is_some();
+        let mut u = old.unwrap_or(TrafficUsage {
+            cycle_start,
+            ..Default::default()
+        });
+
+        // 跨周期：把上一周期存进归档表，再把计数归零
+        let rolled = existed && u.cycle_start < cycle_start;
+        if rolled {
+            if u.cycle_start > 0 && (u.rx > 0 || u.tx > 0) {
+                t.execute(
+                    "INSERT INTO traffic_history(server_id, cycle_start, rx, tx) VALUES(?1, ?2, ?3, ?4)
+                     ON CONFLICT(server_id, cycle_start) DO UPDATE SET rx = excluded.rx, tx = excluded.tx",
+                    params![server_id, u.cycle_start, u.rx as i64, u.tx as i64],
+                )?;
+            }
+            u.cycle_start = cycle_start;
+            u.rx = 0;
+            u.tx = 0;
+        }
+
+        // last 全为 0 视为「还没有基线」：可能是刚建行，也可能是手动校正过
+        let fresh = u.last_rx == 0 && u.last_tx == 0;
+        let rollback = cur_rx < u.last_rx || cur_tx < u.last_tx;
+        if !fresh && !rollback {
+            u.rx = u.rx.saturating_add(cur_rx - u.last_rx);
+            u.tx = u.tx.saturating_add(cur_tx - u.last_tx);
+        }
+        u.last_rx = cur_rx;
+        u.last_tx = cur_tx;
+        u.updated_at = now;
+
+        t.execute(
+            "INSERT INTO traffic_usage(server_id, cycle_start, rx, tx, last_rx, last_tx, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(server_id) DO UPDATE SET
+                cycle_start = excluded.cycle_start, rx = excluded.rx, tx = excluded.tx,
+                last_rx = excluded.last_rx, last_tx = excluded.last_tx, updated_at = excluded.updated_at",
+            params![
+                server_id,
+                u.cycle_start,
+                u.rx as i64,
+                u.tx as i64,
+                u.last_rx as i64,
+                u.last_tx as i64,
+                u.updated_at
+            ],
+        )?;
+        t.commit()?;
+        Ok(TrafficBump { usage: u, rolled })
+    }
+
+    /// 全部机器的当前周期用量。列表页一次查完，避免每台一条 SQL。
+    pub fn all_traffic(&self) -> HashMap<i64, TrafficUsage> {
+        let c = self.conn.lock().unwrap();
+        let Ok(mut stmt) = c.prepare(
+            "SELECT server_id, cycle_start, rx, tx, last_rx, last_tx, updated_at FROM traffic_usage",
+        ) else {
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, row_to_traffic_at(r, 1)?)));
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    pub fn get_traffic(&self, server_id: i64) -> TrafficUsage {
+        let c = self.conn.lock().unwrap();
+        c.query_row(
+            "SELECT cycle_start, rx, tx, last_rx, last_tx, updated_at FROM traffic_usage WHERE server_id=?1",
+            params![server_id],
+            row_to_traffic,
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    /// 手动校正：把当前周期已用量改成 `used_bytes`（None = 归零）。
+    ///
+    /// 按口径反推 rx/tx：能保持原来的上下行比例就按比例缩放，否则整个记到
+    /// 计费方向上。基线 `last_rx/last_tx` 一并清零，下一次上报重新建基线 ——
+    /// 换机 / Agent 长期离线后累计读数已经没有可比性了。
+    pub fn reset_traffic(
+        &self,
+        server_id: i64,
+        cycle_start: i64,
+        used_bytes: Option<u64>,
+        mode: TrafficMode,
+        now: i64,
+    ) -> rusqlite::Result<TrafficUsage> {
+        let old = self.get_traffic(server_id);
+        let target = used_bytes.unwrap_or(0);
+        let old_used = mode.used(old.rx, old.tx);
+        let (rx, tx) = if target == 0 {
+            (0, 0)
+        } else if old_used > 0 {
+            let scale = |v: u64| (v as u128 * target as u128 / old_used as u128) as u64;
+            (scale(old.rx), scale(old.tx))
+        } else if mode == TrafficMode::Up {
+            (0, target)
+        } else {
+            (target, 0)
+        };
+
+        let u = TrafficUsage {
+            cycle_start,
+            rx,
+            tx,
+            last_rx: 0,
+            last_tx: 0,
+            updated_at: now,
+        };
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO traffic_usage(server_id, cycle_start, rx, tx, last_rx, last_tx, updated_at)
+             VALUES(?1, ?2, ?3, ?4, 0, 0, ?5)
+             ON CONFLICT(server_id) DO UPDATE SET
+                cycle_start = excluded.cycle_start, rx = excluded.rx, tx = excluded.tx,
+                last_rx = 0, last_tx = 0, updated_at = excluded.updated_at",
+            params![server_id, cycle_start, rx as i64, tx as i64, now],
+        )?;
+        Ok(u)
+    }
+
+    /// 已归档的历史周期，按时间倒序。
+    pub fn traffic_cycles(&self, server_id: i64, limit: i64) -> Vec<(i64, u64, u64)> {
+        let c = self.conn.lock().unwrap();
+        let Ok(mut stmt) = c.prepare(
+            "SELECT cycle_start, rx, tx FROM traffic_history
+             WHERE server_id=?1 ORDER BY cycle_start DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![server_id, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     // ---------- probes ----------
 
     /// 全部探测目标（后台探测列表）。
@@ -304,7 +533,7 @@ impl Db {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
             .prepare(
-                "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled
+                "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands
                  FROM probes ORDER BY id",
             )
             .unwrap();
@@ -319,7 +548,8 @@ impl Db {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
             .prepare(
-                "SELECT p.id, p.name, p.target, p.protocol, p.port, p.timeout_ms, p.interval_s, p.enabled
+                "SELECT p.id, p.name, p.target, p.protocol, p.port, p.timeout_ms, p.interval_s, p.enabled,
+                        p.latency_bands
                  FROM probes p JOIN probe_assignments a ON a.probe_id = p.id
                  WHERE a.server_id = ?1 ORDER BY p.id",
             )
@@ -333,7 +563,7 @@ impl Db {
     pub fn get_probe(&self, id: i64) -> Option<Probe> {
         let c = self.conn.lock().unwrap();
         c.query_row(
-            "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled
+            "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands
              FROM probes WHERE id=?1",
             params![id],
             row_to_probe,
@@ -429,11 +659,13 @@ impl Db {
         timeout_ms: u64,
         interval_s: u64,
         enabled: bool,
+        bands: Option<&[LatencyBand]>,
     ) -> rusqlite::Result<i64> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO probes(name, target, protocol, port, timeout_ms, interval_s, enabled, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO probes(name, target, protocol, port, timeout_ms, interval_s, enabled, created_at,
+                                latency_bands)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 name,
                 target,
@@ -442,7 +674,8 @@ impl Db {
                 timeout_ms as i64,
                 interval_s as i64,
                 enabled as i64,
-                Self::now_iso()
+                Self::now_iso(),
+                bands_json(bands)
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -459,11 +692,12 @@ impl Db {
         timeout_ms: u64,
         interval_s: u64,
         enabled: bool,
+        bands: Option<&[LatencyBand]>,
     ) -> rusqlite::Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
             "UPDATE probes SET name=?1, target=?2, protocol=?3, port=?4,
-                    timeout_ms=?5, interval_s=?6, enabled=?7 WHERE id=?8",
+                    timeout_ms=?5, interval_s=?6, enabled=?7, latency_bands=?9 WHERE id=?8",
             params![
                 name,
                 target,
@@ -472,7 +706,8 @@ impl Db {
                 timeout_ms as i64,
                 interval_s as i64,
                 enabled as i64,
-                id
+                id,
+                bands_json(bands)
             ],
         )?;
         Ok(())
@@ -726,8 +961,34 @@ fn row_to_server(r: &rusqlite::Row) -> rusqlite::Result<Server> {
         created_at,
         last_seen,
         agent_version: r.get(12)?,
+        traffic: TrafficPlan {
+            limit_bytes: r.get::<_, i64>(13)?.max(0) as u64,
+            mode: TrafficMode::parse(&r.get::<_, String>(14)?),
+            reset_day: r.get::<_, i64>(15)?.clamp(0, 28) as u32,
+        },
         online: false,
     })
+}
+
+fn row_to_traffic(r: &rusqlite::Row) -> rusqlite::Result<TrafficUsage> {
+    row_to_traffic_at(r, 0)
+}
+
+/// 同上，但列从 `off` 开始（`all_traffic` 在前面多带了一列 server_id）。
+fn row_to_traffic_at(r: &rusqlite::Row, off: usize) -> rusqlite::Result<TrafficUsage> {
+    Ok(TrafficUsage {
+        cycle_start: r.get(off)?,
+        rx: r.get::<_, i64>(off + 1)?.max(0) as u64,
+        tx: r.get::<_, i64>(off + 2)?.max(0) as u64,
+        last_rx: r.get::<_, i64>(off + 3)?.max(0) as u64,
+        last_tx: r.get::<_, i64>(off + 4)?.max(0) as u64,
+        updated_at: r.get(off + 5)?,
+    })
+}
+
+/// 分段配色写库前序列化；None（跟随全局默认）落成 SQL NULL。
+fn bands_json(bands: Option<&[LatencyBand]>) -> Option<String> {
+    bands.map(|b| serde_json::to_string(b).unwrap_or_default())
 }
 
 fn row_to_probe(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
@@ -740,6 +1001,10 @@ fn row_to_probe(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
         timeout_ms: r.get::<_, i64>(5)? as u64,
         interval_s: r.get::<_, i64>(6)? as u64,
         enabled: r.get::<_, i64>(7)? != 0,
+        // 解析不出来就当没配（回退全局默认），不因为一行坏数据让整张列表报错
+        latency_bands: r
+            .get::<_, Option<String>>(8)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -758,6 +1023,23 @@ fn migrate_servers(conn: &Connection) -> rusqlite::Result<()> {
     if !has_column(conn, "servers", "agent_version")? {
         tracing::info!("迁移数据库：servers 增加 agent_version 列");
         conn.execute_batch("ALTER TABLE servers ADD COLUMN agent_version TEXT")?;
+    }
+    if !has_column(conn, "servers", "traffic_limit_bytes")? {
+        tracing::info!("迁移数据库：servers 增加流量限额三列");
+        conn.execute_batch(
+            "ALTER TABLE servers ADD COLUMN traffic_limit_bytes INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE servers ADD COLUMN traffic_mode TEXT NOT NULL DEFAULT 'sum';
+             ALTER TABLE servers ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+    Ok(())
+}
+
+/// probes 表的加列式迁移。放在 migrate_probes 之后跑：老库先重建成新结构，再补列。
+fn migrate_probe_bands(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "probes", "latency_bands")? {
+        tracing::info!("迁移数据库：probes 增加 latency_bands 列");
+        conn.execute_batch("ALTER TABLE probes ADD COLUMN latency_bands TEXT")?;
     }
     Ok(())
 }
