@@ -545,32 +545,59 @@ impl Db {
     }
 
     /// 只保留最近的 N 条指标，避免增长无界。
+    /// 用「第 N+1 新的 ts」当水位线，走 (server_id, ts) 索引，不做全表扫描。
     pub fn prune_metrics(&self, server_id: i64, keep: usize) {
         let c = self.conn.lock().unwrap();
         let _ = c.execute(
-            "DELETE FROM metric_samples WHERE server_id=?1 AND id NOT IN (
-                SELECT id FROM metric_samples WHERE server_id=?1 ORDER BY id DESC LIMIT ?2
+            "DELETE FROM metric_samples WHERE server_id=?1 AND ts < (
+                SELECT ts FROM metric_samples WHERE server_id=?1 ORDER BY ts DESC LIMIT 1 OFFSET ?2
             )",
             params![server_id, keep as i64],
         );
     }
 
-    /// 按时间范围查询指标（保留降采样到最多 points 个点）。
+    /// 按时间范围查询指标。样本数超过 points 时直接在 SQL 里按时间桶聚合，
+    /// 均值之外一并带上桶内峰值，长范围曲线不会因为抽样丢掉尖峰。
     pub fn metric_history(&self, server_id: i64, since_ms: i64, points: usize) -> Vec<MetricPoint> {
+        let points = points.max(1);
         let c = self.conn.lock().unwrap();
+        let Some((count, min_ts, max_ts)) = range_stats(
+            &c,
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM metric_samples WHERE server_id=?1 AND ts>=?2",
+            params![server_id, since_ms],
+        ) else {
+            return Vec::new();
+        };
+        if count <= points {
+            let mut stmt = c
+                .prepare(
+                    "SELECT ts, cpu, mem_used, mem_total, disk_used, disk_total, net_in, net_out, load1, uptime
+                     FROM metric_samples WHERE server_id=?1 AND ts>=?2 ORDER BY ts ASC",
+                )
+                .unwrap();
+            return stmt
+                .query_map(params![server_id, since_ms], row_to_metric)
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+        }
+        let bucket = bucket_ms(min_ts, max_ts, points);
         let mut stmt = c
             .prepare(
-                "SELECT ts, cpu, mem_used, mem_total, disk_used, disk_total, net_in, net_out, load1, uptime
-                 FROM metric_samples WHERE server_id=?1 AND ts>=?2 ORDER BY ts ASC",
+                "SELECT CAST(AVG(ts) AS INTEGER), AVG(cpu), MAX(cpu),
+                        CAST(AVG(mem_used) AS INTEGER), CAST(AVG(mem_total) AS INTEGER),
+                        CAST(AVG(disk_used) AS INTEGER), CAST(AVG(disk_total) AS INTEGER),
+                        CAST(AVG(net_in) AS INTEGER), MAX(net_in),
+                        CAST(AVG(net_out) AS INTEGER), MAX(net_out),
+                        AVG(load1), MAX(load1), MAX(uptime)
+                 FROM metric_samples WHERE server_id=?1 AND ts>=?2
+                 GROUP BY (ts - ?3) / ?4 ORDER BY 1 ASC",
             )
             .unwrap();
-        let rows: Vec<MetricPoint> = stmt
-            .query_map(params![server_id, since_ms], row_to_metric)
+        stmt.query_map(params![server_id, since_ms, min_ts, bucket], row_to_metric_bucket)
             .unwrap()
             .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-        downsample(rows, points)
+            .collect()
     }
 
     pub fn insert_probe_result(&self, server_id: i64, r: &ProbeResult) -> rusqlite::Result<()> {
@@ -583,16 +610,18 @@ impl Db {
         Ok(())
     }
 
+    /// 同 prune_metrics：按 (server_id, ts) 索引裁掉水位线以前的探测结果。
     pub fn prune_probe_results(&self, server_id: i64, keep: usize) {
         let c = self.conn.lock().unwrap();
         let _ = c.execute(
-            "DELETE FROM probe_results WHERE server_id=?1 AND id NOT IN (
-                SELECT id FROM probe_results WHERE server_id=?1 ORDER BY id DESC LIMIT ?2
+            "DELETE FROM probe_results WHERE server_id=?1 AND ts < (
+                SELECT ts FROM probe_results WHERE server_id=?1 ORDER BY ts DESC LIMIT 1 OFFSET ?2
             )",
             params![server_id, keep as i64],
         );
     }
 
+    /// 探测历史。长范围同样在 SQL 里聚合：延迟取均值与峰值，丢包取桶内失败比例。
     pub fn probe_history(
         &self,
         probe_id: i64,
@@ -600,20 +629,45 @@ impl Db {
         since_ms: i64,
         points: usize,
     ) -> Vec<ProbePoint> {
+        let points = points.max(1);
         let c = self.conn.lock().unwrap();
+        let Some((count, min_ts, max_ts)) = range_stats(
+            &c,
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM probe_results
+             WHERE probe_id=?1 AND server_id=?2 AND ts>=?3",
+            params![probe_id, server_id, since_ms],
+        ) else {
+            return Vec::new();
+        };
+        if count <= points {
+            let mut stmt = c
+                .prepare(
+                    "SELECT ts, ok, latency_ms FROM probe_results
+                     WHERE probe_id=?1 AND server_id=?2 AND ts>=?3 ORDER BY ts ASC",
+                )
+                .unwrap();
+            return stmt
+                .query_map(params![probe_id, server_id, since_ms], row_to_probe_point)
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+        }
+        let bucket = bucket_ms(min_ts, max_ts, points);
+        // 失败的样本 latency_ms 为 NULL，AVG / MAX 会自动跳过，只统计成功那部分。
         let mut stmt = c
             .prepare(
-                "SELECT ts, ok, latency_ms FROM probe_results
-                 WHERE probe_id=?1 AND server_id=?2 AND ts>=?3 ORDER BY ts ASC",
+                "SELECT CAST(AVG(ts) AS INTEGER), SUM(ok), COUNT(*), AVG(latency_ms), MAX(latency_ms)
+                 FROM probe_results WHERE probe_id=?1 AND server_id=?2 AND ts>=?3
+                 GROUP BY (ts - ?4) / ?5 ORDER BY 1 ASC",
             )
             .unwrap();
-        let rows: Vec<ProbePoint> = stmt
-            .query_map(params![probe_id, server_id, since_ms], row_to_probe_point)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-        downsample(rows, points)
+        stmt.query_map(
+            params![probe_id, server_id, since_ms, min_ts, bucket],
+            row_to_probe_bucket,
+        )
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
     }
 
     /// 统计某客户端对某探测目标最近 window 秒的可用率与平均延迟。
@@ -743,6 +797,30 @@ fn row_to_metric(r: &rusqlite::Row) -> rusqlite::Result<MetricPoint> {
         net_out: r.get::<_, i64>(7)? as u64,
         load1: r.get(8)?,
         uptime: r.get::<_, i64>(9)? as u64,
+        cpu_max: None,
+        net_in_max: None,
+        net_out_max: None,
+        load1_max: None,
+    })
+}
+
+/// 聚合后的指标桶，列顺序与 metric_history 里的 GROUP BY 查询一致。
+fn row_to_metric_bucket(r: &rusqlite::Row) -> rusqlite::Result<MetricPoint> {
+    Ok(MetricPoint {
+        ts: r.get(0)?,
+        cpu: r.get::<_, f64>(1)? as f32,
+        mem_used: r.get::<_, i64>(3)? as u64,
+        mem_total: r.get::<_, i64>(4)? as u64,
+        disk_used: r.get::<_, i64>(5)? as u64,
+        disk_total: r.get::<_, i64>(6)? as u64,
+        net_in: r.get::<_, i64>(7)? as u64,
+        net_out: r.get::<_, i64>(9)? as u64,
+        load1: r.get(11)?,
+        uptime: r.get::<_, i64>(13)? as u64,
+        cpu_max: Some(r.get::<_, f64>(2)? as f32),
+        net_in_max: Some(r.get::<_, i64>(8)? as u64),
+        net_out_max: Some(r.get::<_, i64>(10)? as u64),
+        load1_max: Some(r.get(12)?),
     })
 }
 
@@ -751,22 +829,39 @@ fn row_to_probe_point(r: &rusqlite::Row) -> rusqlite::Result<ProbePoint> {
         ts: r.get(0)?,
         ok: r.get::<_, i64>(1)? != 0,
         latency_ms: r.get(2)?,
+        latency_max: None,
+        loss: None,
     })
 }
 
-/// 若点数超过上限，按时间桶取平均值降采样，控制图表数据量。
-fn downsample<T: Clone>(rows: Vec<T>, points: usize) -> Vec<T> {
-    let n = rows.len();
-    if n <= points || points == 0 {
-        return rows;
-    }
-    let bucket = n.div_ceil(points);
-    let mut out = Vec::with_capacity(n / bucket);
-    let mut i = 0;
-    while i < n {
-        let last = if i + bucket < n { i + bucket } else { n };
-        out.push(rows[i].clone()); // 取桶内首条作为代表，保持 ts 单调
-        i = last;
-    }
-    out
+/// 聚合后的探测桶：ok 表示桶内至少成功一次，loss 是失败占比。
+fn row_to_probe_bucket(r: &rusqlite::Row) -> rusqlite::Result<ProbePoint> {
+    let ok_count: i64 = r.get(1)?;
+    let total: i64 = r.get(2)?;
+    Ok(ProbePoint {
+        ts: r.get(0)?,
+        ok: ok_count > 0,
+        latency_ms: r.get(3)?,
+        latency_max: r.get(4)?,
+        loss: Some(1.0 - ok_count as f64 / total.max(1) as f64),
+    })
+}
+
+/// 范围内的样本数与首末时间；范围为空时返回 None。
+fn range_stats(c: &Connection, sql: &str, p: impl rusqlite::Params) -> Option<(usize, i64, i64)> {
+    c.query_row(sql, p, |r| {
+        Ok((
+            r.get::<_, i64>(0)? as usize,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+        ))
+    })
+    .ok()
+    .and_then(|(n, lo, hi)| Some((n, lo?, hi?)))
+}
+
+/// 时间桶宽度：把 [min_ts, max_ts] 均分成不超过 points 个桶。
+fn bucket_ms(min_ts: i64, max_ts: i64, points: usize) -> i64 {
+    let span = (max_ts - min_ts).max(1);
+    span / points as i64 + 1
 }

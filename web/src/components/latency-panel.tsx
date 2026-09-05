@@ -4,19 +4,18 @@
 import { Spline } from "lucide-react";
 import { useState } from "react";
 
-import { LatencyStrip, ProbeChart, probeStats } from "@/components/metric-chart";
+import {
+  LatencyStrip,
+  METRIC_RANGES,
+  ProbeChart,
+  type RangeKey,
+  RangeTabs,
+  probeStats,
+} from "@/components/metric-chart";
 import { Button } from "@/components/ui/button";
 import { useAsync } from "@/lib/hooks";
 import type { ProbePoint } from "@/lib/types";
 import { cn, fmtLatency, fmtTime } from "@/lib/utils";
-
-const RANGES = [
-  { key: "1h", label: "1 小时", ms: 3_600_000, points: 180 },
-  { key: "6h", label: "6 小时", ms: 6 * 3_600_000, points: 240 },
-  { key: "24h", label: "24 小时", ms: 24 * 3_600_000, points: 288 },
-] as const;
-
-type RangeKey = (typeof RANGES)[number]["key"];
 
 export interface LatencyTarget {
   server_id: number;
@@ -32,19 +31,21 @@ interface Props {
   load: (pid: number, serverId: number, sinceMs: number, points: number) => Promise<ProbePoint[]>;
   /** 锁定客户端（服务器详情页已经在某台机器的上下文里） */
   lockedServerId?: number;
+  /** 由页面统一控制时间范围时传入，此时面板里不再显示范围切换 */
+  span?: { ms: number; points: number };
   height?: number;
 }
 
-export function LatencyPanel({ probeId, targets, load, lockedServerId, height = 200 }: Props) {
+export function LatencyPanel({ probeId, targets, load, lockedServerId, span, height = 200 }: Props) {
   const [range, setRange] = useState<RangeKey>("1h");
   const [smooth, setSmooth] = useState(false);
   const [picked, setPicked] = useState<number | null>(null);
-  const cfg = RANGES.find((r) => r.key === range) ?? RANGES[0];
+  const cfg = span ?? METRIC_RANGES.find((r) => r.key === range) ?? METRIC_RANGES[0];
   const serverId = lockedServerId ?? picked ?? targets[0]?.server_id ?? null;
 
   const { data, loading } = useAsync<ProbePoint[]>(
     () => (serverId == null ? Promise.resolve([]) : load(probeId, serverId, Date.now() - cfg.ms, cfg.points)),
-    [probeId, serverId, range],
+    [probeId, serverId, cfg.ms, cfg.points],
   );
 
   const rows = data ?? [];
@@ -87,23 +88,7 @@ export function LatencyPanel({ probeId, targets, load, lockedServerId, height = 
           </div>
         )}
         <div className="ml-auto flex items-center gap-2">
-          <div className="flex rounded-md border p-0.5">
-            {RANGES.map((r) => (
-              <button
-                key={r.key}
-                type="button"
-                onClick={() => setRange(r.key)}
-                className={cn(
-                  "rounded px-2 py-1 text-xs font-medium transition-colors",
-                  range === r.key
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
+          {!span && <RangeTabs value={range} onChange={setRange} ranges={METRIC_RANGES} />}
           <Button
             type="button"
             size="sm"
@@ -141,11 +126,11 @@ export function LatencyPanel({ probeId, targets, load, lockedServerId, height = 
 
       <LatencyStrip data={rows} />
 
-      <ProbeChart data={rows} height={height} smooth={smooth} />
+      <ProbeChart data={rows} height={height} smooth={smooth} spanMs={cfg.ms} />
 
       <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
         {loading ? <span>加载中…</span> : <span>{st.count} 条记录</span>}
-        {st.fails > 0 && <span className="text-red-600 dark:text-red-400">{st.fails} 次失败</span>}
+        {st.fails > 0 && <span className="text-red-600 dark:text-red-400">{st.fails} 个采样点有丢包</span>}
         {rows.length > 0 && <span className="ml-auto">{fmtTime(rows[0].ts)} 起</span>}
       </div>
     </div>

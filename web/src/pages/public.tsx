@@ -1,37 +1,27 @@
-//! 公开状态页：不登录即可查看服务器状态与延迟探测，右上角留后台入口。
+//! 公开状态页：不登录即可查看节点状态，点卡片进节点详情；线路对比作为次级视图折叠在下方。
 
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChevronDown, ChevronRight, LogIn, Radio, RefreshCw, Waypoints } from "lucide-react";
+import { ChevronDown, ChevronRight, Waypoints } from "lucide-react";
 
 import { Flag } from "@/components/flag";
 import { LatencyPanel } from "@/components/latency-panel";
-import { MetricChart, type Series } from "@/components/metric-chart";
+import { PublicHeader } from "@/components/public-header";
 import { OnlineBadge, ProbeTargetChip, UsageBar } from "@/components/status";
-import { ThemeToggle } from "@/components/theme";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { api, getToken, isMock } from "@/lib/api";
+import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, usePublicEvents } from "@/lib/hooks";
 import type { MetricPoint, ProbeItem, PublicOverview, PublicServer } from "@/lib/types";
 import { fmtBytes, fmtTime, pct, uptimeText } from "@/lib/utils";
 
-const USAGE_SERIES: Series[] = [
-  { key: "cpu", label: "CPU", color: "var(--chart-1)", unit: "pct" },
-  { key: "mem_pct", label: "内存", color: "var(--chart-2)", unit: "pct" },
-];
-
 export default function PublicPage() {
   const { data, loading, reload, setData } = useAsync<PublicOverview>(() => api.publicOverview(), []);
   const [live, setLive] = useState<Record<number, MetricPoint>>({});
   const [onlineMap, setOnlineMap] = useState<Record<number, boolean>>({});
-  const [openServer, setOpenServer] = useState<number | null>(null);
   const [openProbe, setOpenProbe] = useState<number | null>(null);
-  // 首屏默认展开第一条延迟曲线，用户点过之后完全听用户的
-  const [probeTouched, setProbeTouched] = useState(false);
-  const loggedIn = !!getToken();
+  const [showProbes, setShowProbes] = useState(true);
 
   usePublicEvents((e) => {
     if (e.type === "metrics") {
@@ -54,6 +44,7 @@ export default function PublicPage() {
     } else if (e.type === "server_status") {
       setOnlineMap((m) => ({ ...m, [e.id]: e.online }));
     } else if (e.type === "probe") {
+      // 只更新受影响探测的那一台客户端，避免整页重拉
       setData((d) =>
         d
           ? {
@@ -89,50 +80,22 @@ export default function PublicPage() {
 
   const online = servers.filter((x) => x.online).length;
   const probes = data?.probes ?? [];
-  const activeProbe = probeTouched ? openProbe : (probes[0]?.id ?? null);
-  const toggleProbe = (id: number) => {
-    setProbeTouched(true);
-    setOpenProbe(activeProbe === id ? null : id);
-  };
 
   return (
     <div className="min-h-screen bg-muted/30">
-      <header className="sticky top-0 z-20 border-b bg-background/85 backdrop-blur">
-        <div className="mx-auto flex h-14 w-full max-w-6xl items-center gap-2 px-4 sm:gap-3">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Radio className="size-4" />
-          </div>
-          <div className="mr-auto">
-            <div className="text-sm font-bold leading-none">MyProbe</div>
-            <div className="text-[11px] text-muted-foreground">服务器与链路状态</div>
-          </div>
-          <Badge variant={online === servers.length && servers.length > 0 ? "success" : "warning"}>
-            {online} / {servers.length} 在线
-          </Badge>
-          <ThemeToggle />
-          <Button variant="outline" size="icon" title="刷新" onClick={reload}>
-            <RefreshCw className="size-4" />
-          </Button>
-          <Button variant={loggedIn ? "default" : "outline"} size="sm" asChild>
-            <Link to={loggedIn ? "/overview" : "/login"} title={loggedIn ? "进入后台" : "后台登录"}>
-              <LogIn className="size-4" />
-              <span className="hidden sm:inline">{loggedIn ? "进入后台" : "后台登录"}</span>
-            </Link>
-          </Button>
-        </div>
-      </header>
-
-      {isMock() && (
-        <div className="bg-amber-100 px-4 py-1.5 text-center text-xs text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
-          Mock 数据模式：当前展示本地示例数据
-        </div>
-      )}
+      <PublicHeader subtitle="服务器与链路状态" onRefresh={reload}>
+        <Badge variant={online === servers.length && servers.length > 0 ? "success" : "warning"}>
+          {online} / {servers.length} 在线
+        </Badge>
+      </PublicHeader>
 
       <main className="mx-auto w-full max-w-6xl space-y-6 p-4 md:p-6">
         <section className="space-y-3">
-          <div className="flex items-baseline gap-2">
+          <div className="flex flex-wrap items-baseline gap-2">
             <h2 className="text-base font-semibold">节点</h2>
-            <span className="text-xs text-muted-foreground">{servers.length} 台</span>
+            <span className="text-xs text-muted-foreground">
+              {servers.length} 台 · 点开某台可看历史曲线与它到各目标的延迟
+            </span>
           </div>
           {servers.length === 0 ? (
             <Card>
@@ -143,45 +106,49 @@ export default function PublicPage() {
           ) : (
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {servers.map(({ s, online: on, m }) => (
-                <ServerCard
-                  key={s.id}
-                  server={s}
-                  online={on}
-                  m={m}
-                  open={openServer === s.id}
-                  onToggle={() => setOpenServer((v) => (v === s.id ? null : s.id))}
-                />
+                <ServerCard key={s.id} server={s} online={on} m={m} />
               ))}
             </div>
           )}
         </section>
 
         <section className="space-y-3">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-base font-semibold">延迟探测</h2>
+          <button
+            type="button"
+            onClick={() => setShowProbes((v) => !v)}
+            aria-expanded={showProbes}
+            className="flex w-full flex-wrap items-center gap-2 text-left"
+          >
+            {showProbes ? (
+              <ChevronDown className="size-4 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="size-4 text-muted-foreground" />
+            )}
+            <h2 className="text-base font-semibold">线路对比</h2>
             <span className="text-xs text-muted-foreground">
-              {probes.length} 个目标 · 点开可切换节点、时间范围与平滑曲线
+              {probes.length} 个目标 · 按目标横向比较各节点
             </span>
-          </div>
-          {probes.length === 0 ? (
-            <Card>
-              <div className="flex flex-col items-center gap-2 py-14 text-center text-sm text-muted-foreground">
-                <Waypoints className="size-6" />
-                {loading ? "加载中…" : "暂未公开延迟探测"}
+          </button>
+          {showProbes &&
+            (probes.length === 0 ? (
+              <Card>
+                <div className="flex flex-col items-center gap-2 py-14 text-center text-sm text-muted-foreground">
+                  <Waypoints className="size-6" />
+                  {loading ? "加载中…" : "暂未公开延迟探测"}
+                </div>
+              </Card>
+            ) : (
+              <div className="space-y-3">
+                {probes.map((p) => (
+                  <ProbeCard
+                    key={p.id}
+                    probe={p}
+                    open={openProbe === p.id}
+                    onToggle={() => setOpenProbe((v) => (v === p.id ? null : p.id))}
+                  />
+                ))}
               </div>
-            </Card>
-          ) : (
-            <div className="space-y-3">
-              {probes.map((p) => (
-                <ProbeCard
-                  key={p.id}
-                  probe={p}
-                  open={activeProbe === p.id}
-                  onToggle={() => toggleProbe(p.id)}
-                />
-              ))}
-            </div>
-          )}
+            ))}
         </section>
       </main>
 
@@ -192,75 +159,60 @@ export default function PublicPage() {
   );
 }
 
-function ServerCard({
-  server,
-  online,
-  m,
-  open,
-  onToggle,
-}: {
-  server: PublicServer;
-  online: boolean;
-  m: MetricPoint | null;
-  open: boolean;
-  onToggle: () => void;
-}) {
+/** 节点卡片：整卡是通往 /s/:id 的链接，卡面只放一眼能看完的现状。 */
+function ServerCard({ server, online, m }: { server: PublicServer; online: boolean; m: MetricPoint | null }) {
   return (
-    <Card>
-      <CardContent className="space-y-3 p-4">
-        <div className="flex items-start gap-2">
-          <Flag code={server.country} className="mt-0.5 text-base" />
-          <div className="min-w-0 flex-1">
-            <div className="truncate font-medium">{server.name}</div>
-            <div className="truncate text-xs text-muted-foreground">{countryName(server.country)}</div>
+    <Card className="transition-colors hover:border-primary/40 hover:bg-accent/30">
+      <Link
+        to={`/s/${server.id}`}
+        className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <CardContent className="space-y-3 p-4">
+          <div className="flex items-start gap-2">
+            <Flag code={server.country} className="mt-0.5 text-base" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-medium">{server.name}</div>
+              <div className="truncate text-xs text-muted-foreground">{countryName(server.country)}</div>
+            </div>
+            <OnlineBadge online={online} />
           </div>
-          <OnlineBadge online={online} />
-        </div>
 
-        <div className="grid grid-cols-3 gap-3">
-          <UsageBar label="CPU" pct={m ? m.cpu : null} />
-          <UsageBar
-            label="内存"
-            pct={m ? pct(m.mem_used, m.mem_total) : null}
-            detail={m ? `${fmtBytes(m.mem_used)} / ${fmtBytes(m.mem_total)}` : undefined}
-          />
-          <UsageBar
-            label="磁盘"
-            pct={m ? pct(m.disk_used, m.disk_total) : null}
-            detail={m ? `${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}` : undefined}
-          />
-        </div>
+          <div className="grid grid-cols-3 gap-3">
+            <UsageBar label="CPU" pct={m ? m.cpu : null} />
+            <UsageBar
+              label="内存"
+              pct={m ? pct(m.mem_used, m.mem_total) : null}
+              detail={m ? `${fmtBytes(m.mem_used)} / ${fmtBytes(m.mem_total)}` : undefined}
+            />
+            <UsageBar
+              label="磁盘"
+              pct={m ? pct(m.disk_used, m.disk_total) : null}
+              detail={m ? `${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}` : undefined}
+            />
+          </div>
 
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5 text-[11px] text-muted-foreground">
-          <span className="tabular-nums">↓ {m ? fmtBytes(m.net_in) : "—"}/s</span>
-          <span className="tabular-nums">↑ {m ? fmtBytes(m.net_out) : "—"}/s</span>
-          <span>
-            {m ? uptimeText(m.uptime) : server.last_seen ? `${fmtTime(server.last_seen)} 后失联` : "从未连接"}
-          </span>
-          <button
-            type="button"
-            onClick={onToggle}
-            className="ml-auto flex items-center gap-1 transition-colors hover:text-foreground"
-          >
-            {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}近 1 小时
-          </button>
-        </div>
-
-        {open && <ServerChart id={server.id} />}
-      </CardContent>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5 text-[11px] text-muted-foreground">
+            <span className="tabular-nums">↓ {m ? fmtBytes(m.net_in) : "—"}/s</span>
+            <span className="tabular-nums">↑ {m ? fmtBytes(m.net_out) : "—"}/s</span>
+            <span>
+              {m
+                ? uptimeText(m.uptime)
+                : server.last_seen
+                  ? `${fmtTime(server.last_seen)} 后失联`
+                  : "从未连接"}
+            </span>
+            <span className="ml-auto flex items-center gap-0.5">
+              详情
+              <ChevronRight className="size-3.5" />
+            </span>
+          </div>
+        </CardContent>
+      </Link>
     </Card>
   );
 }
 
-function ServerChart({ id }: { id: number }) {
-  const { data } = useAsync<MetricPoint[]>(() => api.publicMetrics(id, Date.now() - 3_600_000, 120), [id]);
-  const rows = useMemo(
-    () => (data ?? []).map((p) => ({ ...p, mem_pct: pct(p.mem_used, p.mem_total) })),
-    [data],
-  );
-  return <MetricChart data={rows} series={USAGE_SERIES} height={140} />;
-}
-
+/** 线路卡片：一个探测目标 + 它在各节点上的表现，点开看曲线。 */
 function ProbeCard({ probe, open, onToggle }: { probe: ProbeItem; open: boolean; onToggle: () => void }) {
   const target = probe.protocol === "tcp" && probe.port ? `${probe.target}:${probe.port}` : probe.target;
   return (

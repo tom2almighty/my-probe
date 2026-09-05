@@ -1,5 +1,6 @@
 //! Agent 长连接处理：认证注册、指标接收、配置下发、离线判定。
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use axum::extract::State;
@@ -22,10 +23,51 @@ pub async fn ws_agent(State(st): State<AppState>, ws: WebSocketUpgrade) -> Respo
 
 /// 上报间隔秒数 -> 数据库落盘节流的毫秒数。
 const PERSIST_EVERY_MS: u128 = 15_000;
-/// 每台服务器最多保留的指标条数（15s 一条 ≈ 6 天）。
-const MAX_METRIC_ROWS: usize = 40_000;
-/// 每台服务器最多保留的探测结果条数。
-const MAX_PROBE_ROWS: usize = 80_000;
+/// 同一个探测目标两次落库的最小间隔。按目标各自计时，
+/// 一台机器同时跑多个探测时不会互相挤掉。
+const PROBE_PERSIST_EVERY_MS: u128 = 1_000;
+/// 每台服务器最多保留的指标条数（15s 一条 ≈ 10 天）。
+const MAX_METRIC_ROWS: usize = 60_000;
+/// 每台服务器最多保留的探测结果条数（该机器上所有探测共享，
+/// 10 个目标各 60s 一次 ≈ 13 天）。
+const MAX_PROBE_ROWS: usize = 200_000;
+/// 每写入多少条做一次行数上限清理。清理要扫索引，没必要每条都做，
+/// 超期数据另有 retention_loop 兜底。
+const PRUNE_EVERY: u32 = 200;
+
+/// 单条 Agent 连接的落库节流状态。
+struct PersistState {
+    /// 上次写入指标的时间，None 表示这条连接还没写过。
+    last_metric: Option<Instant>,
+    /// 每个探测目标各自的上次落库时间。
+    last_probe: HashMap<i64, Instant>,
+    metric_writes: u32,
+    probe_writes: u32,
+}
+
+impl PersistState {
+    fn new() -> Self {
+        PersistState {
+            last_metric: None,
+            last_probe: HashMap::new(),
+            metric_writes: 0,
+            probe_writes: 0,
+        }
+    }
+
+    fn metric_due(&self) -> bool {
+        due(self.last_metric.as_ref(), PERSIST_EVERY_MS)
+    }
+
+    fn probe_due(&self, probe_id: i64) -> bool {
+        due(self.last_probe.get(&probe_id), PROBE_PERSIST_EVERY_MS)
+    }
+}
+
+/// 距上次落库是否已超过 gap 毫秒。从未落过就直接放行，连上立刻留一条。
+fn due(last: Option<&Instant>, gap: u128) -> bool {
+    last.is_none_or(|t| t.elapsed().as_millis() >= gap)
+}
 
 async fn agent_conn(st: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -104,15 +146,14 @@ async fn agent_conn(st: AppState, socket: WebSocket) {
     let conn_id = st.agents.register(server_id, tx);
     let agents = st.agents.clone();
 
-    let mut last_persist = Instant::now();
-    let mut last_probe_persist = Instant::now();
+    let mut persist = PersistState::new();
 
     loop {
         tokio::select! {
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(Message::Text(t))) => {
-                        handle_text(&st, server_id, &t, &mut last_persist, &mut last_probe_persist).await;
+                        handle_text(&st, server_id, &t, &mut persist).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
                         // 回复 pong，保持底层链路存活
@@ -199,13 +240,7 @@ fn build_config_msg(st: &AppState, server: &Server) -> Option<String> {
 }
 
 /// 处理 Agent 发来的一条文本消息。
-async fn handle_text(
-    st: &AppState,
-    server_id: i64,
-    text: &str,
-    last_persist: &mut Instant,
-    last_probe_persist: &mut Instant,
-) {
+async fn handle_text(st: &AppState, server_id: i64, text: &str, persist: &mut PersistState) {
     let msg = match serde_json::from_str::<AgentToServer>(text) {
         Ok(m) => m,
         Err(e) => {
@@ -237,6 +272,10 @@ async fn handle_text(
                     net_out: m.net_out_rate,
                     load1: m.load_one,
                     uptime: m.uptime_s,
+                    cpu_max: None,
+                    net_in_max: None,
+                    net_out_max: None,
+                    load1_max: None,
                 },
             );
 
@@ -256,13 +295,16 @@ async fn handle_text(
             });
 
             // 节流落盘 + 清理
-            if last_persist.elapsed().as_millis() >= PERSIST_EVERY_MS {
+            if persist.metric_due() {
                 if let Err(e) = st.db.insert_metric(server_id, &m) {
                     tracing::warn!("写指标失败: {e}");
                 } else {
                     st.db.touch_last_seen(server_id, m.ts);
-                    st.db.prune_metrics(server_id, MAX_METRIC_ROWS);
-                    *last_persist = now;
+                    persist.last_metric = Some(now);
+                    persist.metric_writes += 1;
+                    if persist.metric_writes % PRUNE_EVERY == 0 {
+                        st.db.prune_metrics(server_id, MAX_METRIC_ROWS);
+                    }
                 }
             }
 
@@ -283,12 +325,15 @@ async fn handle_text(
                 latency_ms: r.latency_ms,
             });
 
-            if last_probe_persist.elapsed().as_millis() >= 1000 {
+            if persist.probe_due(r.probe_id) {
                 if let Err(e) = st.db.insert_probe_result(server_id, &r) {
                     tracing::warn!("写探测结果失败: {e}");
                 } else {
-                    st.db.prune_probe_results(server_id, MAX_PROBE_ROWS);
-                    *last_probe_persist = now;
+                    persist.last_probe.insert(r.probe_id, now);
+                    persist.probe_writes += 1;
+                    if persist.probe_writes % PRUNE_EVERY == 0 {
+                        st.db.prune_probe_results(server_id, MAX_PROBE_ROWS);
+                    }
                 }
             }
 

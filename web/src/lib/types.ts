@@ -94,6 +94,12 @@ export interface PublicOverview {
   ts: number;
 }
 
+/**
+ * 一条整机指标样本。
+ *
+ * 长时间范围的历史查询由主控在 SQL 里按时间桶聚合：主字段是桶内均值，
+ * `*_max` 是桶内峰值。未聚合的原始点不带峰值字段。
+ */
 export interface MetricPoint {
   ts: number;
   cpu: number;
@@ -105,12 +111,20 @@ export interface MetricPoint {
   net_out: number;
   load1: number;
   uptime: number;
+  cpu_max?: number;
+  net_in_max?: number;
+  net_out_max?: number;
+  load1_max?: number;
 }
 
+/** 一条延迟探测样本。聚合点的 `latency_ms` 是桶内均值，另带峰值与丢包比例。 */
 export interface ProbePoint {
   ts: number;
   ok: boolean;
   latency_ms: number | null;
+  latency_max?: number;
+  /** 桶内丢包比例（0-1）；原始点没有这个字段，用 ok 判断即可。 */
+  loss?: number;
 }
 
 export interface StatusResp {

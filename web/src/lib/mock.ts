@@ -25,6 +25,10 @@ function between(min: number, max: number): number {
   return min + rnd() * (max - min);
 }
 
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
 /** 稳定伪随机：同样的 (a, b, i) 永远得到同一个值，重新拉取曲线不会跳变。 */
 function hashRnd(a: number, b: number, i: number): number {
   let h = Math.imul(a, 73_856_093) ^ Math.imul(b, 19_349_663) ^ Math.imul(i, 83_492_791);
@@ -76,7 +80,11 @@ interface ServerCfg {
   mem: number;
 }
 
+/** 各预置节点的基准占用，合成任意时间窗的曲线时用。 */
+const serverBase = new Map<number, ServerCfg>();
+
 function makeServer(id: number, name: string, country: string, online: boolean, cfg: ServerCfg): MockServer {
+  serverBase.set(id, cfg);
   const metrics = makeMetrics(48, cfg.cpu, cfg.mem);
   return {
     id,
@@ -107,6 +115,56 @@ export const mockServers: MockServer[] = [
   makeServer(5, "德国法兰克福", "de", true, { daysLeft: 210, price: 199, cycle: "year", cpu: 51, mem: 0.55 }),
   makeServer(6, "韩国首尔", "kr", false, { daysLeft: 0, price: 77, cycle: "month", cpu: 22, mem: 0.35 }),
 ];
+
+/**
+ * 整机指标曲线：按请求的时间窗与点数合成，形状只取决于时间戳，反复拉取不跳变。
+ * 与主控一致 —— 原始样本（15 秒一条）多于请求点数时按桶聚合：主字段是均值，另带桶内峰值。
+ */
+export function mockMetricSeries(serverId: number, sinceMs: number, points = 288): MetricPoint[] {
+  const cfg = serverBase.get(serverId);
+  const srv = mockServers.find((s) => s.id === serverId);
+  if (!cfg || !srv) return [];
+  const end = Date.now();
+  const cutoff = srv.online ? end : srv.last_seen;
+  const span = Math.max(10 * 60_000, end - sinceMs);
+  const n = clamp(Math.round(points), 2, 1000);
+  const agg = span / 15_000 > n;
+  const memTotal = 16 * 1024 ** 3;
+  const diskTotal = 1024 * 1024 ** 3;
+  const rows: MetricPoint[] = [];
+  for (let i = n; i >= 0; i--) {
+    const ts = Math.round(end - (i * span) / n);
+    if (ts > cutoff) continue;
+    const r = hashRnd(serverId, 7, i);
+    // 以天为周期的起伏 + 稳定抖动，长范围下也有明显的忙闲差别
+    const day = Math.sin((ts / 86_400_000) * Math.PI * 2) * cfg.cpu * 0.22;
+    const cpu = clamp(cfg.cpu + day + Math.sin(i / 7 + serverId) * cfg.cpu * 0.1 + (r - 0.5) * 6, 1, 99);
+    const netIn = Math.round((20 + hashRnd(serverId, 11, i) * 110) * 1024);
+    const netOut = Math.round((40 + hashRnd(serverId, 13, i) * 360) * 1024);
+    const load1 = clamp(cpu / 22 + (hashRnd(serverId, 17, i) - 0.4) * 0.9, 0.05, 12);
+    const row: MetricPoint = {
+      ts,
+      cpu,
+      mem_used: Math.round(memTotal * cfg.mem * (1 + Math.sin(i / 9 + serverId) * 0.06)),
+      mem_total: memTotal,
+      disk_used: Math.round(diskTotal * (0.35 + (serverId % 5) * 0.09) + (n - i) * 40_000_000),
+      disk_total: diskTotal,
+      net_in: netIn,
+      net_out: netOut,
+      load1,
+      uptime: Math.max(60, Math.round((ts - (end - 5 * 86_400_000)) / 1000)),
+    };
+    if (agg) {
+      // 桶内峰值：偶发尖刺不会被均值抹平
+      row.cpu_max = clamp(cpu + (r > 0.88 ? 18 + r * 28 : 3 + r * 8), 1, 100);
+      row.net_in_max = Math.round(netIn * (1.3 + r * 1.2));
+      row.net_out_max = Math.round(netOut * (1.25 + r * 1.1));
+      row.load1_max = clamp(load1 * (1.25 + r * 0.8), 0.05, 16);
+    }
+    rows.push(row);
+  }
+  return rows;
+}
 
 function makeProbe(
   id: number,
@@ -147,6 +205,7 @@ export const mockProbes: MockProbe[] = [
 /**
  * 某探测在某客户端上的延迟曲线：抖动 + 偶发尖刺 + 成片丢包。
  * 离线客户端的数据停在最后一次上报之前，和真实情况一致。
+ * 同样跟随主控的聚合规则：样本数超过请求点数时给出桶内均值 / 峰值 / 丢包比例。
  */
 export function mockProbeSeries(
   probeId: number,
@@ -161,6 +220,7 @@ export function mockProbeSeries(
   const end = Date.now();
   const cutoff = srv && !srv.online ? srv.last_seen : end;
   const span = Math.max(10 * 60_000, end - sinceMs);
+  const agg = span / ((p?.interval_s ?? 60) * 1000) > points;
   const rows: ProbePoint[] = [];
   let burst = 0;
   for (let i = points; i >= 0; i--) {
@@ -170,11 +230,22 @@ export function mockProbeSeries(
     else if (r < loss) burst = 1 + Math.floor(hashRnd(i, probeId, serverId) * 3);
     const ts = Math.round(end - (i * span) / points);
     if (ts > cutoff) continue;
-    const ok = burst === 0;
     const wave = Math.sin(i / 9 + serverId) * base * 0.16;
     const jitter = (hashRnd(serverId, i, probeId) - 0.5) * base * 0.3;
     const spike = hashRnd(probeId, i, serverId) > 0.975 ? base * (0.8 + r) : 0;
-    rows.push({ ts, ok, latency_ms: ok ? Math.max(1, base + wave + jitter + spike) : null });
+    const ms = Math.max(1, base + wave + jitter + spike);
+    if (!agg) {
+      const ok = burst === 0;
+      rows.push({ ts, ok, latency_ms: ok ? ms : null });
+      continue;
+    }
+    // 聚合桶：突发期成片丢包，平时偶尔掉一两个包
+    const frac = burst > 0 ? Math.min(1, 0.3 + r * 0.9) : r < loss * 4 ? 0.02 + r * 0.08 : 0;
+    rows.push(
+      frac >= 1
+        ? { ts, ok: false, latency_ms: null, loss: 1 }
+        : { ts, ok: true, latency_ms: ms, latency_max: ms * (1.2 + r * 0.9), loss: frac },
+    );
   }
   return rows;
 }
@@ -184,9 +255,10 @@ export function mockProbeStat(probeId: number, serverId: number) {
   const rows = mockProbeSeries(probeId, serverId, Date.now() - 24 * HOUR, 288);
   if (rows.length === 0) return { last: null, ok_24h: null, avg_latency_ms: null };
   const ok = rows.filter((r) => r.latency_ms != null);
+  const lost = rows.reduce((a, r) => a + (r.loss ?? (r.ok ? 0 : 1)), 0);
   return {
     last: rows[rows.length - 1],
-    ok_24h: rows.filter((r) => r.ok).length / rows.length,
+    ok_24h: 1 - lost / rows.length,
     avg_latency_ms: ok.length ? ok.reduce((a, r) => a + (r.latency_ms ?? 0), 0) / ok.length : null,
   };
 }

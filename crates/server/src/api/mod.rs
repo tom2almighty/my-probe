@@ -39,6 +39,19 @@ pub fn internal(e: impl std::fmt::Display) -> ApiErr {
     ApiErr::new(StatusCode::INTERNAL_SERVER_ERROR, format!("内部错误: {e}"))
 }
 
+/// 历史查询单次最多返回的点数。
+const MAX_HISTORY_POINTS: usize = 1_000;
+/// 历史查询最长回溯范围（毫秒）。比默认保留天数留了余量。
+const MAX_HISTORY_RANGE_MS: i64 = 31 * 86_400_000;
+
+/// 夹紧历史查询参数。公开接口无需登录，范围与点数必须有上限，
+/// 否则一次请求就能让主控去扫整张表。
+pub fn clamp_history(since_ms: i64, points: usize) -> (i64, usize) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let earliest = now - MAX_HISTORY_RANGE_MS;
+    (since_ms.clamp(earliest, now), points.clamp(1, MAX_HISTORY_POINTS))
+}
+
 /// 需要登录的 REST 路由（由 main 挂 JWT 中间件）。
 pub fn protected_router() -> Router<AppState> {
     Router::new()

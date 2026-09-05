@@ -263,6 +263,13 @@ pub struct HistoryQuery {
     pub points: usize,
 }
 
+impl HistoryQuery {
+    /// 夹紧后的 (since_ms, points)。
+    pub fn clamped(&self) -> (i64, usize) {
+        crate::api::clamp_history(self.since_ms, self.points)
+    }
+}
+
 fn default_history_ms() -> i64 {
     chrono::Utc::now().timestamp_millis() - 24 * 3600 * 1000
 }
@@ -276,7 +283,8 @@ pub async fn metrics_history(
     Path(id): Path<i64>,
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Vec<crate::models::MetricPoint>> {
-    Ok(Json(st.db.metric_history(id, q.since_ms, q.points)))
+    let (since_ms, points) = q.clamped();
+    Ok(Json(st.db.metric_history(id, since_ms, points)))
 }
 
 // ---------- 状态总览 ----------

@@ -16,7 +16,17 @@ import {
 import { toast } from "sonner";
 
 import { Flag } from "@/components/flag";
-import { MetricChart, type Series } from "@/components/metric-chart";
+import {
+  ChartBlock,
+  LOAD_SERIES,
+  METRIC_RANGES,
+  MetricChart,
+  NET_SERIES,
+  type RangeKey,
+  RangeTabs,
+  USAGE_SERIES,
+  toChartRows,
+} from "@/components/metric-chart";
 import { SecretDialog } from "@/components/secret-dialog";
 import { ServerFormDialog, type ServerFormValue } from "@/components/server-form";
 import { ExpireBadge, OnlineBadge, RenewInfo, StatTile } from "@/components/status";
@@ -39,29 +49,6 @@ import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
 import type { MetricPoint, ServerDetail } from "@/lib/types";
 import { fmtBytes, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
 
-const RANGES = [
-  { key: "1h", label: "1 小时", ms: 3_600_000, points: 180 },
-  { key: "6h", label: "6 小时", ms: 6 * 3_600_000, points: 240 },
-  { key: "24h", label: "24 小时", ms: 24 * 3_600_000, points: 288 },
-  { key: "7d", label: "7 天", ms: 7 * 24 * 3_600_000, points: 336 },
-] as const;
-
-type RangeKey = (typeof RANGES)[number]["key"];
-type ChartRow = MetricPoint & { mem_pct: number; disk_pct: number };
-
-const USAGE_SERIES: Series[] = [
-  { key: "cpu", label: "CPU", color: "var(--chart-1)", unit: "pct" },
-  { key: "mem_pct", label: "内存", color: "var(--chart-2)", unit: "pct" },
-  { key: "disk_pct", label: "磁盘", color: "var(--chart-3)", unit: "pct" },
-];
-
-const NET_SERIES: Series[] = [
-  { key: "net_in", label: "下行", color: "var(--chart-4)", unit: "bytes" },
-  { key: "net_out", label: "上行", color: "var(--chart-5)", unit: "bytes" },
-];
-
-const LOAD_SERIES: Series[] = [{ key: "load1", label: "1 分钟负载", color: "var(--chart-1)", unit: "abs" }];
-
 export default function ServerDetailPage() {
   const { id: idParam } = useParams();
   const id = Number(idParam);
@@ -70,7 +57,7 @@ export default function ServerDetailPage() {
 
   const detail = useAsync<ServerDetail>(() => api.server(id), [id]);
   const [range, setRange] = useState<RangeKey>("1h");
-  const cfg = RANGES.find((r) => r.key === range) ?? RANGES[0];
+  const cfg = METRIC_RANGES.find((r) => r.key === range) ?? METRIC_RANGES[0];
   const history = useAsync<MetricPoint[]>(
     () => api.metrics(id, Date.now() - cfg.ms, cfg.points),
     [id, range],
@@ -100,7 +87,7 @@ export default function ServerDetailPage() {
       };
       setLiveM(p);
       setLiveOnline(true);
-      history.setData((rows) => [...(rows ?? []), p].slice(-720));
+      history.setData((rows) => [...(rows ?? []), p].slice(-1000));
     } else if (e.type === "server_status" && e.id === id) {
       setLiveOnline(e.online);
     } else if (e.type === "servers_changed") {
@@ -108,15 +95,7 @@ export default function ServerDetailPage() {
     }
   });
 
-  const rows = useMemo<ChartRow[]>(
-    () =>
-      (history.data ?? []).map((p) => ({
-        ...p,
-        mem_pct: pct(p.mem_used, p.mem_total),
-        disk_pct: pct(p.disk_used, p.disk_total),
-      })),
-    [history.data],
-  );
+  const rows = useMemo(() => toChartRows(history.data), [history.data]);
 
   const saveServer = async (v: ServerFormValue) => {
     try {
@@ -270,38 +249,23 @@ export default function ServerDetailPage() {
 
       <Card>
         <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
-          <div>
+          <div className="min-w-0">
             <CardTitle className="text-base">历史指标</CardTitle>
             <CardDescription>
-              {rows.length ? `${rows.length} 个采样点` : "暂无采样"}，主控按 15 秒节流落库
+              {rows.length ? `${rows.length} 个采样点` : "暂无采样"}，长范围由主控按时间桶聚合
             </CardDescription>
           </div>
-          <div className="flex rounded-md border p-0.5">
-            {RANGES.map((r) => (
-              <button
-                key={r.key}
-                type="button"
-                onClick={() => setRange(r.key)}
-                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  range === r.key
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
+          <RangeTabs value={range} onChange={setRange} ranges={METRIC_RANGES} />
         </CardHeader>
         <CardContent className="space-y-6">
-          <ChartBlock title="占用率" legend={USAGE_SERIES}>
-            <MetricChart data={rows} series={USAGE_SERIES} />
+          <ChartBlock title="占用率" legend={USAGE_SERIES} hint="虚线为该时段峰值">
+            <MetricChart data={rows} series={USAGE_SERIES} spanMs={cfg.ms} />
           </ChartBlock>
           <ChartBlock title="网络速率" legend={NET_SERIES}>
-            <MetricChart data={rows} height={200} series={NET_SERIES} />
+            <MetricChart data={rows} height={200} series={NET_SERIES} spanMs={cfg.ms} />
           </ChartBlock>
           <ChartBlock title="平均负载" legend={LOAD_SERIES}>
-            <MetricChart data={rows} height={160} series={LOAD_SERIES} />
+            <MetricChart data={rows} height={160} series={LOAD_SERIES} spanMs={cfg.ms} />
           </ChartBlock>
         </CardContent>
       </Card>
@@ -358,33 +322,6 @@ function InfoItem({ label, children }: { label: string; children: React.ReactNod
     <div className="space-y-1">
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="text-sm">{children}</div>
-    </div>
-  );
-}
-
-function ChartBlock({
-  title,
-  legend,
-  children,
-}: {
-  title: string;
-  legend: { label: string; color: string }[];
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap items-center gap-3">
-        <span className="text-sm font-medium">{title}</span>
-        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-          {legend.map((l) => (
-            <span key={l.label} className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full" style={{ background: l.color }} />
-              {l.label}
-            </span>
-          ))}
-        </div>
-      </div>
-      {children}
     </div>
   );
 }

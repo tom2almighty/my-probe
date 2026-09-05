@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::Message;
 use serde::Serialize;
@@ -56,6 +56,8 @@ pub struct AppState {
     pub alerts: AlertState,
     /// 最新指标内存缓存。
     pub live: LiveMetrics,
+    /// 公开接口的短时缓存。
+    pub public_cache: Arc<PublicCache>,
     pub offline_after_s: u64,
     /// 全局 id 计数器（用于临时生成的告警 key 等）。
     #[allow(dead_code)]
@@ -306,6 +308,57 @@ pub fn latest_metric(state: &AppState, server_id: i64) -> Option<models::MetricP
         .live
         .get(server_id)
         .or_else(|| state.db.latest_metric(server_id))
+}
+
+/// 只读结果的短时缓存。公开接口不需要登录，同一时间窗口内的重复请求
+/// 压成一次查询，避免被反复刷新拖着扫库。
+pub struct TtlCache<T> {
+    ttl: Duration,
+    inner: Mutex<HashMap<String, (Instant, Arc<T>)>>,
+}
+
+impl<T> TtlCache<T> {
+    pub fn new(ttl: Duration) -> Self {
+        TtlCache {
+            ttl,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 命中未过期的缓存直接返回，否则调用 build 计算并写回。
+    /// build 在锁外执行，查询期间不挡住其他 key。
+    pub fn get_or_insert(&self, key: String, build: impl FnOnce() -> T) -> Arc<T> {
+        {
+            let mut map = self.inner.lock().unwrap();
+            map.retain(|_, (at, _)| at.elapsed() < self.ttl); // 顺手清掉过期项
+            if let Some((_, v)) = map.get(&key) {
+                return v.clone();
+            }
+        }
+        let v = Arc::new(build());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), v.clone()));
+        v
+    }
+}
+
+/// 公开接口的缓存集合。总览的 TTL 更短，因为它同时靠 WS 事件保持实时。
+pub struct PublicCache {
+    pub overview: TtlCache<crate::api::public::PublicOverview>,
+    pub metrics: TtlCache<Vec<models::MetricPoint>>,
+    pub probe_history: TtlCache<Vec<models::ProbePoint>>,
+}
+
+impl Default for PublicCache {
+    fn default() -> Self {
+        PublicCache {
+            overview: TtlCache::new(Duration::from_secs(3)),
+            metrics: TtlCache::new(Duration::from_secs(10)),
+            probe_history: TtlCache::new(Duration::from_secs(10)),
+        }
+    }
 }
 
 pub fn mask_secret(s: &str) -> String {

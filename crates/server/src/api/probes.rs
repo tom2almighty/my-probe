@@ -298,6 +298,13 @@ pub struct HistoryQuery {
     pub server_id: Option<i64>,
 }
 
+impl HistoryQuery {
+    /// 夹紧后的 (since_ms, points)。
+    pub fn clamped(&self) -> (i64, usize) {
+        crate::api::clamp_history(self.since_ms, self.points)
+    }
+}
+
 fn default_history_ms() -> i64 {
     chrono::Utc::now().timestamp_millis() - 24 * 3600 * 1000
 }
@@ -318,7 +325,8 @@ pub fn history_points(st: &AppState, pid: i64, q: &HistoryQuery) -> Result<Vec<P
             .first()
             .ok_or(ApiErr::new(StatusCode::BAD_REQUEST, "该探测尚未指派客户端"))?,
     };
-    Ok(st.db.probe_history(pid, server_id, q.since_ms, q.points))
+    let (since_ms, points) = q.clamped();
+    Ok(st.db.probe_history(pid, server_id, since_ms, points))
 }
 
 pub async fn history(

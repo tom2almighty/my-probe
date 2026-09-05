@@ -4,6 +4,7 @@ import {
   type MockProbe,
   type MockServer,
   mockAlertRules,
+  mockMetricSeries,
   mockNotifiers,
   mockProbeSeries,
   mockProbeStat,
@@ -405,10 +406,10 @@ const mockApi: ApiClient = {
     if (!p) throw new Error("探测目标不存在");
     p.server_ids = [...serverIds];
   },
-  metrics: async (id, sinceMs) => {
-    const s = state.servers.find((x) => x.id === id);
-    const rows = s?.metrics ?? [];
-    return mockDelay(sinceMs == null ? rows : rows.filter((m) => m.ts >= sinceMs));
+  metrics: async (id, sinceMs, points) => {
+    // 只有预置节点有历史曲线，界面上新建的服务器显示“暂无数据”
+    if (!state.servers.some((s) => s.id === id)) throw new Error("服务器不存在");
+    return mockDelay(mockMetricSeries(id, sinceMs ?? Date.now() - 3_600_000, points));
   },
   probeHistory: async (pid, serverId, sinceMs, points) => {
     const p = state.probes.find((x) => x.id === pid);

@@ -39,6 +39,15 @@ export function fmtTime(ts: number): string {
   return `${mm}-${dd} ${fmtClock(ts)}`;
 }
 
+/** 图表刻度：跨度超过一天时带上日期，否则只到分钟。 */
+export function fmtAxis(ts: number, spanMs: number): string {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  const hm = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+  if (spanMs > 36 * 3600_000) return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  return hm;
+}
+
 /** 延迟毫秒 → 展示 */
 export function fmtLatency(ms: number | null | undefined): string {
   if (ms == null) return "—";

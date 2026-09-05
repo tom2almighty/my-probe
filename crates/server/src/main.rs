@@ -69,6 +69,7 @@ async fn main() {
         ui_tx,
         alerts: state::AlertState::default(),
         live: state::LiveMetrics::default(),
+        public_cache: Arc::new(state::PublicCache::default()),
         offline_after_s: cfg.offline_after_s,
         next_id: Arc::new(AtomicU64::new(0)),
         started_at: std::time::Instant::now(),

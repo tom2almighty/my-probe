@@ -129,6 +129,9 @@ impl From<&Probe> for myprobe_shared::protocol::ProbeConfig {
 }
 
 /// 一条整机指标样本（用于历史图表）。
+///
+/// 长时间范围的查询在 SQL 里按时间桶聚合，主字段是桶内均值，`*_max` 是桶内峰值；
+/// 未聚合的原始点上峰值字段为 None，序列化时直接省略。
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricPoint {
     pub ts: i64,
@@ -141,14 +144,28 @@ pub struct MetricPoint {
     pub net_out: u64,
     pub load1: f64,
     pub uptime: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_max: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_in_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_out_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load1_max: Option<f64>,
 }
 
-/// 一条延迟探测样本（用于历史图表）。
+/// 一条延迟探测样本（用于历史图表）。聚合点上 `latency_ms` 为桶内均值，
+/// 额外带上峰值与丢包比例；原始点只有成功/失败与单次延迟。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbePoint {
     pub ts: i64,
     pub ok: bool,
     pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_max: Option<f64>,
+    /// 桶内丢包比例（0-1）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss: Option<f64>,
 }
 
 /// 告警规则（全局，存 settings JSON）。
