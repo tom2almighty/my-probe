@@ -41,6 +41,11 @@ jobs:
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
+      # 版本号跟随 v* tag。放在 rust-cache 之后：缓存键按原始 Cargo.lock 算，不会每次发版都失效
+      - name: 同步版本号
+        shell: bash
+        run: bash scripts/set-version.sh "${{ github.ref_name }}"
+
       - name: 构建
         shell: bash
         env:

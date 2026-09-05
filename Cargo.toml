@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/shared", "crates/server", "crates/agent"]
 
+# 版本号整个仓库只有这一行，三个 crate 都写 version.workspace = true 继承。
+# 发版时由 scripts/set-version.sh 按 v* tag 覆写，所以仓库里长期是 0.0.0——
+# 从源码直接编出来的二进制就该报 0.0.0，一眼能和发布版区分开。
+[workspace.package]
+version = "0.0.0"
+
 # 发布产物追求“单文件好分发”：去符号 + thin LTO，体积明显更小
 [profile.release]
 strip = true

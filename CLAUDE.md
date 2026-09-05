@@ -111,3 +111,5 @@ React 19 + react-router-dom 7 + Vite 8 + Tailwind 4 + Radix（`components/ui/*` 
 ## 发布
 
 推 `v*` tag 触发 `release.yml`：并行跑主控 / 客户端 / 镜像三条流水线，二进制进 Release（附 `SHA256SUMS`），镜像进 GHCR。Linux 目标是 musl 静态链接，bundled SQLite 需要 `CC_*_unknown_linux_musl: musl-gcc`。产物名不带版本号，`releases/latest/download/<名字>` 才能长期可用——一键脚本的自动更新依赖这一点。
+
+版本号跟着 tag 走，不用手动维护：根清单 `[workspace.package] version` 长期是 `0.0.0`，三个 crate 都写 `version.workspace = true`，三条流水线在 `cargo build` 之前各跑一次 `scripts/set-version.sh "$GITHUB_REF_NAME"`，把 `v1.2.3` 写成 `1.2.3`。ref 不是 `v*` tag（手动触发、CI 验证、本地）就原样跳过，所以非发布产物报 `0.0.0`，一眼能和发布版区分。脚本改完清单会顺手 `cargo update --workspace` 同步 `Cargo.lock`——发布构建带 `--locked`，成员版本号对不上会直接失败；镜像那条线在容器里编、runner 上未必有 cargo，跳过也没事（`Dockerfile` 里没有 `--locked`）。这条链是面板「有新版本」标记的唯一来源：`crates/agent` 两处 `CARGO_PKG_VERSION` 上报 `agent_version`，前端 `cmpVer` 拿各机器最高版本比对，版本号不跟 tag 那个标记就永远不亮。

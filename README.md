@@ -156,4 +156,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-发版推一个 `v*` tag，GitHub Actions 构建各平台二进制与多架构镜像并汇总成 Release。
+发版推一个 `v*` tag，GitHub Actions 构建各平台二进制与多架构镜像并汇总成 Release。版本号跟着 tag 走，`Cargo.toml` 里的 `0.0.0` 只是占位，构建前由 `scripts/set-version.sh` 写成 tag 的版本，所以自己编的二进制会报 `0.0.0`。

@@ -25,6 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # 版本号跟随 v* tag：改完的 Cargo.toml 一起进构建上下文，容器里编出来的就带这个版本
+      - name: 同步版本号
+        run: bash scripts/set-version.sh "${{ github.ref_name }}"
+
       # GHCR 只认小写路径，仓库属主可能带大写
       - name: 计算镜像名
         run: |
