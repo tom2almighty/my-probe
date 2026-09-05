@@ -2,7 +2,19 @@
 
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { KeyRound, MoreHorizontal, Pencil, Plus, RefreshCw, Search, ServerIcon, Trash2 } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  GripVertical,
+  KeyRound,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Search,
+  ServerIcon,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Flag } from "@/components/flag";
@@ -36,12 +48,12 @@ import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
 import { modeLabel, resetText, trafficText, withLiveUsed } from "@/lib/traffic";
 import type { MetricPoint, Server, Traffic } from "@/lib/types";
-import { fmtBytes, fmtPct, fmtTime, pct } from "@/lib/utils";
+import { cn, fmtBytes, fmtPct, fmtTime, pct } from "@/lib/utils";
 
 type Filter = "all" | "online" | "offline";
 
 export default function ServersPage() {
-  const { data, loading, reload } = useAsync<Server[]>(() => api.servers(), []);
+  const { data, loading, reload, setData } = useAsync<Server[]>(() => api.servers(), []);
   const onError = useErrorHandler();
 
   const [live, setLive] = useState<Record<number, MetricPoint>>({});
@@ -56,6 +68,8 @@ export default function ServersPage() {
   const [secret, setSecret] = useState<{ name: string; secret: string } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Server | null>(null);
   const [rotating, setRotating] = useState<Server | null>(null);
+  // 拖动中的行与当前悬停的目标行；松手时把 id 顺序整份提交
+  const [drag, setDrag] = useState<{ id: number; over: number | null } | null>(null);
 
   useUiEvents((e) => {
     if (e.type === "metrics") {
@@ -107,6 +121,71 @@ export default function ServersPage() {
         );
       });
   }, [data, live, liveUsed, onlineMap, q, filter]);
+
+  // 搜索 / 筛选后 rows 只是列表的一个子集，拖出来的顺序没法对应到整表，此时不许排序
+  const sortable = !q.trim() && filter === "all";
+
+  /**
+   * 顺序整份提交。先就地摆好本地列表：等一次往返再刷会有明显的回跳感；
+   * 主控收到后会广播 `servers_changed`，其他标签页跟着 reload。
+   */
+  const commitOrder = async (ids: number[]) => {
+    const rank = new Map(ids.map((id, i) => [id, i]));
+    setData((list) => list && [...list].sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0)));
+    try {
+      await api.reorderServers(ids);
+    } catch (e) {
+      onError(e, "排序保存失败");
+      reload(); // 失败就把服务端的真实顺序拉回来
+    }
+  };
+
+  /** 拖到某一行上就顶掉它的位置：往下拖落在目标之后，往上拖落在目标之前。 */
+  const dropOn = (targetId: number) => {
+    const from = drag?.id;
+    setDrag(null);
+    if (from == null || from === targetId) return;
+    const ids = (data ?? []).map((x) => x.id);
+    const i = ids.indexOf(from);
+    const j = ids.indexOf(targetId);
+    if (i < 0 || j < 0) return;
+    // j 是删除前的下标：往下拖时目标已左移一位，插在 j 正好落到它原来的槽位
+    ids.splice(i, 1);
+    ids.splice(j, 0, from);
+    commitOrder(ids);
+  };
+
+  /** 键盘 / 触屏用的上移下移，和拖动共用一条提交路径。 */
+  const moveBy = (id: number, delta: -1 | 1) => {
+    const ids = (data ?? []).map((x) => x.id);
+    const i = ids.indexOf(id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    commitOrder(ids);
+  };
+
+  /** 一行的拖动事件。筛选状态下返回空对象，行就是拖不动的。 */
+  const dragProps = (id: number): React.HTMLAttributes<HTMLTableRowElement> =>
+    sortable
+      ? {
+          draggable: true,
+          onDragStart: (e) => {
+            // Firefox 要求 dragstart 里塞点数据才肯起拖，顺序仍从 drag 状态里读
+            e.dataTransfer.setData("text/plain", String(id));
+            e.dataTransfer.effectAllowed = "move";
+            setDrag({ id, over: null });
+          },
+          // 用 dragenter 而不是 dragover 记目标：dragover 每几毫秒一次，没必要跟着刷
+          onDragEnter: () => setDrag((d) => (d && d.over !== id ? { ...d, over: id } : d)),
+          onDragOver: (e) => e.preventDefault(), // 不拦掉默认行为就不会触发 drop
+          onDragEnd: () => setDrag(null),
+          onDrop: (e) => {
+            e.preventDefault();
+            dropOn(id);
+          },
+        }
+      : {};
 
   // 所有机器里最高的 Agent 版本，用来标出哪台还没更新
   const newestVersion = useMemo(() => {
@@ -229,6 +308,8 @@ export default function ServersPage() {
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
               <tr>
+                {/* 手柄列，没有表头文字 */}
+                <th className="w-8" />
                 <th className="px-4 py-2.5 text-left font-medium">服务器</th>
                 <th className="px-3 py-2.5 text-left font-medium">状态</th>
                 <th className="px-3 py-2.5 text-left font-medium">CPU</th>
@@ -242,8 +323,23 @@ export default function ServersPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ s, online, m, traffic }) => (
-                <tr key={s.id} className="border-b transition-colors last:border-0 hover:bg-muted/40">
+              {rows.map(({ s, online, m, traffic }, i) => (
+                <tr
+                  key={s.id}
+                  {...dragProps(s.id)}
+                  className={cn(
+                    "border-b transition-colors last:border-0 hover:bg-muted/40",
+                    drag?.id === s.id && "opacity-50",
+                    // 松手就把拖动行放到这一行的位置上，所以高亮的是目标行
+                    drag?.over === s.id && "bg-accent/60",
+                  )}
+                >
+                  <td
+                    className="px-2 py-2.5 text-muted-foreground"
+                    title={sortable ? "拖动调整顺序" : "搜索或筛选时不能调整顺序"}
+                  >
+                    <GripVertical className={cn("size-4", sortable ? "cursor-grab" : "opacity-30")} />
+                  </td>
                   <td className="px-4 py-2.5">
                     <div className="flex items-center gap-2">
                       <Flag code={s.country} className="text-base" />
@@ -294,10 +390,10 @@ export default function ServersPage() {
                     <TrafficCell traffic={traffic} />
                   </td>
                   <td className="px-3 py-2.5">
-                    <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
+                    <ExpireBadge days={s.days_to_expire} date={s.expire_date} neverExpire={s.never_expire} />
                   </td>
                   <td className="px-3 py-2.5 text-sm">
-                    <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+                    <RenewInfo price={s.renew_price} cycle={s.renew_cycle} currency={s.currency} />
                   </td>
                   <td className="px-3 py-2.5 text-right">
                     <RowActions
@@ -308,6 +404,8 @@ export default function ServersPage() {
                       }}
                       onRotate={() => setRotating(s)}
                       onDelete={() => setPendingDelete(s)}
+                      onMoveUp={sortable && i > 0 ? () => moveBy(s.id, -1) : undefined}
+                      onMoveDown={sortable && i < rows.length - 1 ? () => moveBy(s.id, 1) : undefined}
                     />
                   </td>
                 </tr>
@@ -320,7 +418,7 @@ export default function ServersPage() {
 
       {/* 移动端卡片 */}
       <div className="space-y-3 lg:hidden">
-        {rows.map(({ s, online, m, traffic }) => (
+        {rows.map(({ s, online, m, traffic }, i) => (
           <Card key={s.id}>
             <CardContent className="space-y-3 p-4">
               <div className="flex items-start gap-2">
@@ -340,6 +438,8 @@ export default function ServersPage() {
                   }}
                   onRotate={() => setRotating(s)}
                   onDelete={() => setPendingDelete(s)}
+                  onMoveUp={sortable && i > 0 ? () => moveBy(s.id, -1) : undefined}
+                  onMoveDown={sortable && i < rows.length - 1 ? () => moveBy(s.id, 1) : undefined}
                 />
               </div>
               <div className="grid grid-cols-3 gap-3">
@@ -358,8 +458,8 @@ export default function ServersPage() {
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs">
-                <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
-                <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+                <ExpireBadge days={s.days_to_expire} date={s.expire_date} neverExpire={s.never_expire} />
+                <RenewInfo price={s.renew_price} cycle={s.renew_cycle} currency={s.currency} />
                 <AgentVersion version={s.agent_version} newest={newestVersion} />
                 <span className="ml-auto text-muted-foreground">
                   {m ? fmtTime(m.ts) : s.last_seen ? fmtTime(s.last_seen) : "从未连接"}
@@ -493,11 +593,16 @@ function RowActions({
   onEdit,
   onRotate,
   onDelete,
+  onMoveUp,
+  onMoveDown,
 }: {
   server: Server;
   onEdit: () => void;
   onRotate: () => void;
   onDelete: () => void;
+  /** 移到头 / 尾或正在筛选时不传，菜单里就不出现——触屏与键盘只能靠这两项排序 */
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
 }) {
   return (
     <DropdownMenu>
@@ -515,6 +620,16 @@ function RowActions({
         <DropdownMenuItem onClick={onEdit}>
           <Pencil /> 编辑
         </DropdownMenuItem>
+        {onMoveUp && (
+          <DropdownMenuItem onClick={onMoveUp}>
+            <ArrowUp /> 上移
+          </DropdownMenuItem>
+        )}
+        {onMoveDown && (
+          <DropdownMenuItem onClick={onMoveDown}>
+            <ArrowDown /> 下移
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem onClick={onRotate}>
           <KeyRound /> 重置密钥
         </DropdownMenuItem>

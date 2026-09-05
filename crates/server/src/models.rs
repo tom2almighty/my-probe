@@ -29,12 +29,19 @@ pub struct Server {
     pub agent_version: Option<String>,
     /// 流量限额设置。
     pub traffic: TrafficPlan,
+    /// 永不到期（自建 / 一次性买断），为真时忽略 `expire_date`，也不参与到期提醒。
+    pub never_expire: bool,
+    /// 续费价格的币种，ISO 4217 三字母码。
+    pub currency: String,
     pub online: bool,
 }
 
 impl Server {
-    /// 距离到期的天数。None 表示未配置到期日。
+    /// 距离到期的天数。None 表示不看到期（永不到期，或没填日期）。
     pub fn days_to_expire(&self) -> Option<i64> {
+        if self.never_expire {
+            return None;
+        }
         let d = DateTime::parse_from_str(
             &format!("{}T00:00:00+00:00", self.expire_date.as_ref()?),
             "%Y-%m-%dT%H:%M:%S%z",
@@ -45,6 +52,26 @@ impl Server {
         let expire = d.date_naive();
         Some(expire.signed_duration_since(today).num_days())
     }
+}
+
+/// 服务器的可编辑属性，`Db::create_server` / `update_server` 的入参。
+///
+/// 十几个字段按位置传参太容易错位，也让每次加字段都要改一遍调用点；打包成结构体后
+/// 新增字段只动这里和 SQL。不含 `id` / `secret` / `enabled` / `created_at`：那些不是
+/// 表单字段，各由建机器、启停、建表时间自己管。
+pub struct ServerAttrs {
+    pub name: String,
+    pub country: String,
+    pub note: String,
+    /// 到期日期（YYYY-MM-DD）；`never_expire` 为真时忽略。
+    pub expire_date: Option<String>,
+    pub never_expire: bool,
+    /// ISO 4217 三字母码。
+    pub currency: String,
+    pub renew_price: f64,
+    pub renew_cycle: RenewCycle,
+    pub report_interval_s: u64,
+    pub traffic: TrafficPlan,
 }
 
 /// 续费周期。序列化名称与数据库存储、前端类型保持一致。
@@ -61,6 +88,9 @@ pub enum RenewCycle {
     Year,
     #[serde(rename = "none")]
     NoRenew,
+    /// 免费（甲骨文之类的白嫖机器），价格恒为 0。
+    #[serde(rename = "free")]
+    Free,
 }
 
 impl RenewCycle {
@@ -71,6 +101,7 @@ impl RenewCycle {
             RenewCycle::HalfYear => "half_year",
             RenewCycle::Year => "year",
             RenewCycle::NoRenew => "none",
+            RenewCycle::Free => "free",
         }
     }
     pub fn parse(s: &str) -> Self {
@@ -79,6 +110,7 @@ impl RenewCycle {
             "half_year" => RenewCycle::HalfYear,
             "year" => RenewCycle::Year,
             "none" => RenewCycle::NoRenew,
+            "free" => RenewCycle::Free,
             _ => RenewCycle::Month,
         }
     }
@@ -89,6 +121,7 @@ impl RenewCycle {
             RenewCycle::HalfYear => "按半年",
             RenewCycle::Year => "按年",
             RenewCycle::NoRenew => "不续费",
+            RenewCycle::Free => "免费",
         }
     }
     /// 周期对应天数。
@@ -99,7 +132,7 @@ impl RenewCycle {
             RenewCycle::Quarter => 90,
             RenewCycle::HalfYear => 180,
             RenewCycle::Year => 365,
-            RenewCycle::NoRenew => 0,
+            RenewCycle::NoRenew | RenewCycle::Free => 0,
         }
     }
 }
@@ -263,7 +296,7 @@ pub struct TrafficBump {
 /// 延迟配色的一段。`max_ms` 为该段上限（含），最后一段省略它表示无上限。
 ///
 /// 同一套断点对「同机房 5ms」和「跨洋 200ms」都不合适，所以配色跟着探测目标走：
-/// `probes.latency_bands` 为空时回退到 settings 里的全局默认。
+/// `probes.latency_bands` 为空时回退到命名方案，方案也没引用才用 settings 里的全局默认。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LatencyBand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,6 +323,15 @@ pub fn default_latency_bands() -> Vec<LatencyBand> {
     ]
 }
 
+/// 命名配色方案。同类线路（优化 / 不优化、跨洋 / 同城）共用一套阈值，
+/// 改方案就等于改所有引用它的探测目标，省得一个个改。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyScheme {
+    pub id: i64,
+    pub name: String,
+    pub bands: Vec<LatencyBand>,
+}
+
 /// 探测目标。独立实体，通过 probe_assignments 指派给一到多个客户端执行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Probe {
@@ -301,9 +343,12 @@ pub struct Probe {
     pub timeout_ms: u64,
     pub interval_s: u64,
     pub enabled: bool,
-    /// 自定义延迟配色；None = 跟随全局默认。
+    /// 自定义延迟配色；None = 往下看方案。
     #[serde(default)]
     pub latency_bands: Option<Vec<LatencyBand>>,
+    /// 引用的命名方案；None = 跟随全局默认。自定义分段优先于方案。
+    #[serde(default)]
+    pub latency_scheme_id: Option<i64>,
 }
 
 /// 主控下发给 agent 的探测配置（去掉主控侧独有字段）。

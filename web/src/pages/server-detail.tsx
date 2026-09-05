@@ -256,12 +256,12 @@ export default function ServerDetailPage() {
         <CardContent className="grid gap-4 p-4 sm:grid-cols-2 lg:grid-cols-3">
           <InfoItem label="到期">
             <div className="flex items-center gap-2">
-              <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
+              <ExpireBadge days={s.days_to_expire} date={s.expire_date} neverExpire={s.never_expire} />
               {s.expire_date && <span className="text-xs text-muted-foreground">{s.expire_date}</span>}
             </div>
           </InfoItem>
           <InfoItem label="续费">
-            <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+            <RenewInfo price={s.renew_price} cycle={s.renew_cycle} currency={s.currency} />
           </InfoItem>
           <InfoItem label="运行时长">{m ? uptimeText(m.uptime) : "—"}</InfoItem>
           <InfoItem label="上报间隔">{s.report_interval_s} 秒</InfoItem>

@@ -1,6 +1,6 @@
 //! 与主控后端对应的 TS 类型。
 
-export type RenewCycle = "month" | "quarter" | "half_year" | "year" | "none";
+export type RenewCycle = "month" | "quarter" | "half_year" | "year" | "none" | "free";
 
 /** 流量计费口径。 */
 export type TrafficMode = "up" | "down" | "sum" | "max";
@@ -42,8 +42,12 @@ export interface Server {
   note: string;
   enabled: boolean;
   expire_date: string | null;
+  /** 永不到期：为真时 expire_date 恒为 null，days_to_expire 也是 null */
+  never_expire: boolean;
   renew_price: number;
   renew_cycle: RenewCycle;
+  /** 续费价格的币种，ISO 4217 三字母码 */
+  currency: string;
   report_interval_s: number;
   created_at: string;
   last_seen: number;
@@ -65,8 +69,10 @@ export interface ServerInput {
   note: string;
   enabled: boolean;
   expire_date: string | null;
+  never_expire: boolean;
   renew_price: number;
   renew_cycle: RenewCycle;
+  currency: string;
   report_interval_s: number;
   /** 周期流量限额（字节），0 = 不限制 */
   traffic_limit_bytes: number;
@@ -88,6 +94,13 @@ export interface LatencyBand {
   color: string;
 }
 
+/** 命名配色方案：同类线路共用一套阈值，改方案等于改所有引用它的目标。 */
+export interface LatencyScheme {
+  id: number;
+  name: string;
+  bands: LatencyBand[];
+}
+
 export interface Probe {
   id: number;
   name: string;
@@ -97,12 +110,14 @@ export interface Probe {
   timeout_ms: number;
   interval_s: number;
   enabled: boolean;
-  /** 该目标自定义的配色；null = 跟随全局默认 */
+  /** 该目标自定义的配色；null = 往下看方案 */
   latency_bands: LatencyBand[] | null;
+  /** 引用的命名方案；null = 跟随全局默认。公开视图里恒为 null */
+  latency_scheme_id: number | null;
 }
 
 export interface ProbeView extends Probe {
-  /** 生效配色（后端已回退过全局默认） */
+  /** 生效配色（后端已回退过方案与全局默认） */
   bands: LatencyBand[];
   last: ProbePoint | null;
   ok_24h: number | null;
@@ -123,7 +138,7 @@ export interface ProbeTargetStat {
 
 /** 探测列表条目：探测本身 + 指派的客户端。 */
 export interface ProbeItem extends Probe {
-  /** 生效配色（后端已回退过全局默认） */
+  /** 生效配色（后端已回退过方案与全局默认） */
   bands: LatencyBand[];
   server_ids: number[];
   targets: ProbeTargetStat[];
@@ -139,8 +154,10 @@ export interface ProbeInput {
   interval_s: number;
   enabled: boolean;
   server_ids: number[];
-  /** null = 跟随全局默认配色 */
+  /** null = 往下看方案 */
   latency_bands: LatencyBand[] | null;
+  /** null = 跟随全局默认配色 */
+  latency_scheme_id: number | null;
 }
 
 export interface ServerDetail extends Server {
@@ -213,6 +230,7 @@ export interface StatusResp {
     expire_date: string | null;
     renew_price: number;
     renew_cycle: RenewCycle;
+    currency: string;
   }[];
 }
 
@@ -299,4 +317,5 @@ export const RENEW_CYCLE_LABELS: Record<RenewCycle, string> = {
   half_year: "按半年",
   year: "按年",
   none: "不续费",
+  free: "免费",
 };

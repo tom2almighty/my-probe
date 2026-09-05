@@ -3,6 +3,7 @@
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { latencyColor } from "@/lib/latency";
+import { fmtMoney } from "@/lib/money";
 import { modeLabel, resetText, trafficText } from "@/lib/traffic";
 import {
   type LatencyBand,
@@ -23,8 +24,20 @@ export function OnlineBadge({ online }: { online: boolean }) {
   );
 }
 
-/** 到期倒计时：已过期 / 临期 / 正常 */
-export function ExpireBadge({ days, date }: { days: number | null; date: string | null }) {
+/** 到期倒计时：永久 / 已过期 / 临期 / 正常 */
+export function ExpireBadge({
+  days,
+  date,
+  neverExpire,
+}: {
+  days: number | null;
+  date: string | null;
+  /** 永不到期。和「没填日期」一样都是 days == null，靠这个标记区分出「永久」 */
+  neverExpire?: boolean;
+}) {
+  if (neverExpire) {
+    return <Badge variant="muted">永久</Badge>;
+  }
   if (days == null) {
     return <span className="text-muted-foreground">—</span>;
   }
@@ -37,14 +50,25 @@ export function ExpireBadge({ days, date }: { days: number | null; date: string 
   );
 }
 
-/** 续费信息：价格 + 周期 */
-export function RenewInfo({ price, cycle }: { price: number; cycle: RenewCycle }) {
+/** 续费信息：价格 + 周期。免费机器只标「免费」，不显示 0 元。 */
+export function RenewInfo({
+  price,
+  cycle,
+  currency,
+}: {
+  price: number;
+  cycle: RenewCycle;
+  currency: string;
+}) {
+  if (cycle === "free") {
+    return <Badge variant="muted">免费</Badge>;
+  }
   if (cycle === "none" || !price) {
     return <span className="text-muted-foreground">—</span>;
   }
   return (
     <span className="whitespace-nowrap">
-      <span className="font-medium">{price}</span>
+      <span className="font-medium">{fmtMoney(price, currency)}</span>
       <span className="ml-1 text-xs text-muted-foreground">/ {RENEW_CYCLE_LABELS[cycle]}</span>
     </span>
   );

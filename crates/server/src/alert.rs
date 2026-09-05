@@ -4,7 +4,7 @@ use chrono::Timelike;
 use myprobe_shared::protocol::{MetricsSample, ProbeResult};
 use tokio::time::Duration;
 
-use crate::models::{Server, TrafficUsage};
+use crate::models::{RenewCycle, Server, TrafficUsage};
 use crate::state::{AlertAction, AppState, clear_traffic_alerts};
 
 fn pct(used: u64, total: u64) -> f32 {
@@ -283,14 +283,19 @@ pub async fn daily_expiry_scan(state: &AppState) {
         };
         let dedup = format!("expire:{id}:{date}", id = srv.id, date = expire);
         if state.alerts.once(&dedup) {
-            let msg = format!(
-                "{title}\n到期日：{expire}\n剩余：{days} 天\n续费价：¥{price:.2} / {cycle}",
-                title = title,
-                expire = expire,
-                days = days,
-                price = srv.renew_price,
-                cycle = srv.renew_cycle.label()
-            );
+            // 币种只报三字母码：符号表放前端就够了，通知里写 code 反而不会有歧义。
+            // 免费机器单独一句，否则会出现「续费价：0.00 CNY / 免费」这种废话
+            let cost = if srv.renew_cycle == RenewCycle::Free {
+                "免费".to_string()
+            } else {
+                format!(
+                    "{price:.2} {code} / {cycle}",
+                    price = srv.renew_price,
+                    code = srv.currency,
+                    cycle = srv.renew_cycle.label()
+                )
+            };
+            let msg = format!("{title}\n到期日：{expire}\n剩余：{days} 天\n续费价：{cost}");
             state.notify.broadcast("到期提醒", &msg).await;
         }
     }

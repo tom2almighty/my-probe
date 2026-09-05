@@ -7,6 +7,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LogOut,
+  UserRound,
   Radio,
   Server as ServerIcon,
   Waypoints,
@@ -16,6 +17,7 @@ import { api, isMock, setToken } from "@/lib/api";
 import { useAsync } from "@/lib/hooks";
 import { Badge } from "@/components/ui/badge";
 import { ChangePasswordDialog } from "@/components/change-password";
+import { ChangeUsernameDialog } from "@/components/change-username";
 import { ThemeToggle } from "@/components/theme";
 import {
   DropdownMenu,
@@ -49,9 +51,10 @@ function Brand() {
 
 export default function Layout() {
   const navigate = useNavigate();
-  const { data: me } = useAsync(() => api.me(), []);
+  const { data: me, reload: reloadMe } = useAsync(() => api.me(), []);
   const username = me?.username ?? "admin";
   const [pwOpen, setPwOpen] = useState(false);
+  const [nameOpen, setNameOpen] = useState(false);
 
   const logout = () => {
     setToken(null);
@@ -108,6 +111,9 @@ export default function Layout() {
                   <Globe /> 公开页面
                 </Link>
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setNameOpen(true)}>
+                <UserRound /> 修改用户名
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setPwOpen(true)}>
                 <KeyRound /> 修改密码
               </DropdownMenuItem>
@@ -155,6 +161,9 @@ export default function Layout() {
                   <Globe /> 公开页面
                 </Link>
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setNameOpen(true)}>
+                <UserRound /> 修改用户名
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setPwOpen(true)}>
                 <KeyRound /> 修改密码
               </DropdownMenuItem>
@@ -180,6 +189,12 @@ export default function Layout() {
       </div>
 
       <ChangePasswordDialog open={pwOpen} onOpenChange={setPwOpen} />
+      <ChangeUsernameDialog
+        open={nameOpen}
+        onOpenChange={setNameOpen}
+        current={username}
+        onSaved={reloadMe}
+      />
     </div>
   );
 }

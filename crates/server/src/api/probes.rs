@@ -7,7 +7,7 @@ use myprobe_shared::protocol::ProbeProtocol;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiErr, ApiResult, internal};
-use crate::models::{LatencyBand, Probe, ProbePoint};
+use crate::models::{LatencyBand, LatencyScheme, Probe, ProbePoint};
 use crate::state::{AppState, is_server_online};
 use crate::ws;
 
@@ -36,9 +36,11 @@ pub struct ProbeItem {
     pub timeout_ms: u64,
     pub interval_s: u64,
     pub enabled: bool,
-    /// 该目标自己的配色；null 表示跟随全局默认（编辑表单要靠它区分）。
+    /// 该目标自己的配色；null 表示没自定义（编辑表单要靠它区分）。
     pub latency_bands: Option<Vec<LatencyBand>>,
-    /// 生效的配色（已回退过全局默认），展示端直接用这个。
+    /// 引用的命名方案 id；null 表示跟随全局默认。
+    pub latency_scheme_id: Option<i64>,
+    /// 生效的配色（自定义 → 方案 → 全局默认都回退过），展示端直接用这个。
     pub bands: Vec<LatencyBand>,
     pub server_ids: Vec<i64>,
     pub targets: Vec<ProbeTargetStat>,
@@ -56,7 +58,8 @@ pub struct ProbeView {
     pub interval_s: u64,
     pub enabled: bool,
     pub latency_bands: Option<Vec<LatencyBand>>,
-    /// 生效的配色（已回退过全局默认）。
+    pub latency_scheme_id: Option<i64>,
+    /// 生效的配色（自定义 → 方案 → 全局默认都回退过）。
     pub bands: Vec<LatencyBand>,
     /// 最近一条结果。
     pub last: Option<ProbePoint>,
@@ -66,8 +69,8 @@ pub struct ProbeView {
     pub avg_latency_ms: Option<f64>,
 }
 
-/// 组装某客户端执行某探测的统计。`defaults` 是全局配色，调用方一次取好传进来。
-pub fn probe_view(st: &AppState, p: &Probe, server_id: i64, defaults: &[LatencyBand]) -> ProbeView {
+/// 组装某客户端执行某探测的统计。`bands` 是配色解析器，调用方一次取好传进来。
+pub fn probe_view(st: &AppState, p: &Probe, server_id: i64, bands: &BandResolver) -> ProbeView {
     let last = st.db.probe_latest(p.id, server_id);
     let (ok, avg) = st.db.probe_summary(p.id, server_id, 86_400).unwrap_or((0.0, 0.0));
     let has_data = last.is_some();
@@ -81,18 +84,40 @@ pub fn probe_view(st: &AppState, p: &Probe, server_id: i64, defaults: &[LatencyB
         interval_s: p.interval_s,
         enabled: p.enabled,
         latency_bands: p.latency_bands.clone(),
-        bands: effective_bands(p, defaults),
+        latency_scheme_id: p.latency_scheme_id,
+        bands: bands.resolve(p),
         last,
         ok_24h: has_data.then_some(ok),
         avg_latency_ms: has_data.then_some(avg),
     }
 }
 
-/// 目标自己的配色，没配就用全局默认。
-pub fn effective_bands(p: &Probe, defaults: &[LatencyBand]) -> Vec<LatencyBand> {
-    match &p.latency_bands {
-        Some(b) if !b.is_empty() => b.clone(),
-        _ => defaults.to_vec(),
+/// 配色解析器。方案表与全局默认一次读好，一张列表里的所有探测复用同一份，
+/// 也保证「自定义 → 方案 → 全局默认」这条优先级只有这里一个实现。
+pub struct BandResolver {
+    schemes: Vec<LatencyScheme>,
+    defaults: Vec<LatencyBand>,
+}
+
+impl BandResolver {
+    pub fn load(st: &AppState) -> Self {
+        Self {
+            schemes: st.db.list_latency_schemes(),
+            defaults: st.db.get_latency_bands_default(),
+        }
+    }
+
+    /// 空数组一律当没配：方案被删（id 已被外键置空）或数据坏掉时继续往下回退，
+    /// 前端拿到的 `bands` 永远是可以直接画的。
+    pub fn resolve(&self, p: &Probe) -> Vec<LatencyBand> {
+        if let Some(b) = p.latency_bands.as_ref().filter(|b| !b.is_empty()) {
+            return b.clone();
+        }
+        p.latency_scheme_id
+            .and_then(|id| self.schemes.iter().find(|s| s.id == id))
+            .map(|s| s.bands.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| self.defaults.clone())
     }
 }
 
@@ -120,11 +145,90 @@ pub async fn set_bands_default(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct SchemeReq {
+    pub name: String,
+    pub bands: Vec<LatencyBand>,
+}
+
+/// 命名配色方案列表。方案名只在后台用，不进 UiEvent / 公开视图。
+pub async fn schemes(State(st): State<AppState>, _: crate::auth::AuthUser) -> ApiResult<Vec<LatencyScheme>> {
+    Ok(Json(st.db.list_latency_schemes()))
+}
+
+pub async fn create_scheme(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Json(req): Json<SchemeReq>,
+) -> ApiResult<LatencyScheme> {
+    let name = scheme_name(&req.name)?.to_string();
+    validate_bands(&req.bands).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    let id = st.db.create_latency_scheme(&name, &req.bands).map_err(dup_name)?;
+    st.ui_broadcast();
+    Ok(Json(LatencyScheme {
+        id,
+        name,
+        bands: req.bands,
+    }))
+}
+
+/// 改方案会连带改掉所有引用它的探测目标，所以要广播一次让前端重新拉。
+pub async fn update_scheme(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<SchemeReq>,
+) -> ApiResult<serde_json::Value> {
+    st.db
+        .get_latency_scheme(id)
+        .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "配色方案不存在"))?;
+    let name = scheme_name(&req.name)?;
+    validate_bands(&req.bands).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    st.db.update_latency_scheme(id, name, &req.bands).map_err(dup_name)?;
+    st.ui_broadcast();
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 删除方案。引用它的探测目标由外键置空，回退到全局默认，不必再逐个改。
+pub async fn destroy_scheme(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    st.db
+        .get_latency_scheme(id)
+        .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "配色方案不存在"))?;
+    st.db.delete_latency_scheme(id).map_err(internal)?;
+    st.ui_broadcast();
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 方案名去空格后的公共校验。名字要在下拉里显示，太长会撑破选择框。
+fn scheme_name(raw: &str) -> Result<&str, ApiErr> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(ApiErr::new(StatusCode::BAD_REQUEST, "方案名称不能为空"));
+    }
+    if name.chars().count() > 24 {
+        return Err(ApiErr::new(StatusCode::BAD_REQUEST, "方案名称不超过 24 个字"));
+    }
+    Ok(name)
+}
+
+/// name 上有 UNIQUE 约束，撞名翻成人话，其余错误照旧算内部错误。
+fn dup_name(e: rusqlite::Error) -> ApiErr {
+    if e.to_string().contains("UNIQUE") {
+        ApiErr::new(StatusCode::CONFLICT, "已有同名配色方案")
+    } else {
+        internal(e)
+    }
+}
+
 /// probe_items 同时服务后台与公开视图；public 只保留启用的探测与服务器。
 pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
     let servers = st.db.list_servers();
     let assignments = st.db.probe_assignments();
-    let defaults = st.db.get_latency_bands_default();
+    let bands = BandResolver::load(st);
     st.db
         .list_probes()
         .into_iter()
@@ -140,7 +244,7 @@ pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
                 .filter(|s| server_ids.contains(&s.id))
                 .filter(|s| !public || s.enabled)
                 .map(|s| {
-                    let v = probe_view(st, &p, s.id, &defaults);
+                    let v = probe_view(st, &p, s.id, &bands);
                     ProbeTargetStat {
                         server_id: s.id,
                         server_name: s.name.clone(),
@@ -162,7 +266,9 @@ pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
                 interval_s: p.interval_s,
                 enabled: p.enabled,
                 latency_bands: p.latency_bands.clone(),
-                bands: effective_bands(&p, &defaults),
+                // 方案 id 只有后台编辑表单要用，公开面有解析好的 bands 就够
+                latency_scheme_id: if public { None } else { p.latency_scheme_id },
+                bands: bands.resolve(&p),
                 server_ids,
                 targets,
             }
@@ -186,9 +292,12 @@ pub struct ProbeReq {
     /// 执行该探测的客户端，可为空（先建好、之后再指派）。
     #[serde(default)]
     pub server_ids: Vec<i64>,
-    /// 延迟配色分段；不传或 null = 跟随全局默认。
+    /// 延迟配色分段；不传或 null = 往下看方案。
     #[serde(default)]
     pub latency_bands: Option<Vec<LatencyBand>>,
+    /// 引用的命名方案；不传或 null = 跟随全局默认。
+    #[serde(default)]
+    pub latency_scheme_id: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -258,6 +367,16 @@ pub fn validate_bands(bands: &[LatencyBand]) -> Result<(), String> {
     Ok(())
 }
 
+/// 引用的方案必须存在。外键也会拦，但那样只能甩一句 SQL 错误给用户。
+fn check_scheme(st: &AppState, id: Option<i64>) -> Result<(), ApiErr> {
+    match id {
+        Some(id) if st.db.get_latency_scheme(id).is_none() => {
+            Err(ApiErr::new(StatusCode::BAD_REQUEST, "配色方案不存在"))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// 过滤掉不存在的服务器 id，避免外键报错。
 fn existing_servers(st: &AppState, ids: &[i64]) -> Vec<i64> {
     let mut out: Vec<i64> = st
@@ -277,6 +396,7 @@ pub async fn create(
     Json(req): Json<ProbeReq>,
 ) -> ApiResult<Probe> {
     validate(&req).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    check_scheme(&st, req.latency_scheme_id)?;
     let pid = st
         .db
         .create_probe(
@@ -288,6 +408,7 @@ pub async fn create(
             req.interval_s,
             req.enabled,
             req.latency_bands.as_deref(),
+            req.latency_scheme_id,
         )
         .map_err(|e| ApiErr::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     let servers = existing_servers(&st, &req.server_ids);
@@ -311,6 +432,7 @@ pub async fn update(
         .get_probe(pid)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "探测目标不存在"))?;
     validate(&req).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    check_scheme(&st, req.latency_scheme_id)?;
     st.db
         .update_probe(
             pid,
@@ -322,6 +444,7 @@ pub async fn update(
             req.interval_s,
             req.enabled,
             req.latency_bands.as_deref(),
+            req.latency_scheme_id,
         )
         .map_err(internal)?;
     // 指派关系有变化的客户端 + 原本就在执行的客户端都要重新下发

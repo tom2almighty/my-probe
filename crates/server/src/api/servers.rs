@@ -6,9 +6,9 @@ use axum::http::StatusCode;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::api::probes::{ProbeView, probe_view};
+use crate::api::probes::{BandResolver, ProbeView, probe_view};
 use crate::api::{ApiErr, ApiResult, internal};
-use crate::models::{RenewCycle, TrafficMode, TrafficPlan};
+use crate::models::{RenewCycle, ServerAttrs, TrafficMode, TrafficPlan};
 use crate::state::{
     AppState, ServerView, clear_traffic_alerts, is_server_online, latest_metric, server_view, traffic_view,
 };
@@ -24,10 +24,16 @@ pub struct ServerReq {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub expire_date: Option<String>,
+    /// 永不到期，为真时忽略 `expire_date`。
+    #[serde(default)]
+    pub never_expire: bool,
     #[serde(default)]
     pub renew_price: f64,
     #[serde(default)]
     pub renew_cycle: RenewCycle,
+    /// 续费价格的币种，ISO 4217 三字母码。
+    #[serde(default = "default_currency")]
+    pub currency: String,
     #[serde(default = "default_interval")]
     pub report_interval_s: u64,
     /// 周期流量限额（字节），0 / 不传 = 不限制。
@@ -49,6 +55,9 @@ fn default_interval() -> u64 {
 fn default_reset_day() -> u32 {
     1
 }
+fn default_currency() -> String {
+    "CNY".into()
+}
 
 impl ServerReq {
     fn plan(&self) -> TrafficPlan {
@@ -56,6 +65,31 @@ impl ServerReq {
             limit_bytes: self.traffic_limit_bytes,
             mode: self.traffic_mode,
             reset_day: self.traffic_reset_day,
+        }
+    }
+
+    /// 落库前的规范化：永不到期就不留日期、免费就不留价格，库里只有一种表示，
+    /// 前端与告警都不用再判断「这个字段此刻算不算数」。
+    fn attrs(&self) -> ServerAttrs {
+        ServerAttrs {
+            name: self.name.trim().to_string(),
+            country: self.country.clone(),
+            note: self.note.clone(),
+            expire_date: if self.never_expire {
+                None
+            } else {
+                self.expire_date.clone()
+            },
+            never_expire: self.never_expire,
+            currency: self.currency.trim().to_uppercase(),
+            renew_price: if self.renew_cycle == RenewCycle::Free {
+                0.0
+            } else {
+                self.renew_price
+            },
+            renew_cycle: self.renew_cycle,
+            report_interval_s: self.report_interval_s,
+            traffic: self.plan(),
         }
     }
 }
@@ -70,10 +104,16 @@ fn validate_server_req(r: &ServerReq) -> Result<(), String> {
     if r.report_interval_s == 0 || r.report_interval_s > 3600 {
         return Err("上报间隔需在 1-3600 秒之间".into());
     }
-    if let Some(d) = &r.expire_date {
+    // 永不到期时日期字段作废，不必再挑格式
+    if let (false, Some(d)) = (r.never_expire, &r.expire_date) {
         if chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err() {
             return Err("到期日期格式应为 YYYY-MM-DD".into());
         }
+    }
+    // 只认三字母码：币种只用来选符号与格式，不做汇率换算，多余的校验没有意义
+    let code = r.currency.trim();
+    if code.len() != 3 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err("币种应为三位字母代码，如 CNY / USD".into());
     }
     // 29-31 号并非每月都有，统一限制到 28，避免「这个月不重置」的意外
     if r.traffic_reset_day > 28 {
@@ -130,17 +170,7 @@ pub async fn create(
     let secret = gen_secret();
     let id = st
         .db
-        .create_server(
-            req.name.trim(),
-            &secret,
-            &req.country,
-            &req.note,
-            req.expire_date.as_deref(),
-            req.renew_price,
-            req.renew_cycle,
-            req.report_interval_s as i64,
-            req.plan(),
-        )
+        .create_server(&secret, &req.attrs())
         .map_err(|e| ApiErr::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     let srv = st
         .db
@@ -182,7 +212,7 @@ pub async fn detail(
         .db
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
-    let bands = st.db.get_latency_bands_default();
+    let bands = BandResolver::load(&st);
     let views: Vec<ProbeView> = st
         .db
         .probes_for_server(id)
@@ -222,20 +252,10 @@ pub async fn update(
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
     validate_server_req(&req).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
-    let plan = req.plan();
+    let attrs = req.attrs();
+    let plan = attrs.traffic;
     st.db
-        .update_server(
-            id,
-            req.name.trim(),
-            &req.country,
-            &req.note,
-            req.enabled,
-            req.expire_date.as_deref(),
-            req.renew_price,
-            req.renew_cycle,
-            req.report_interval_s as i64,
-            plan,
-        )
+        .update_server(id, req.enabled, &attrs)
         .map_err(|e| ApiErr::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     // 限额/口径变了，旧的告警去重状态不再有意义
     if srv.traffic != plan {
@@ -244,6 +264,23 @@ pub async fn update(
     st.ui_broadcast();
     // 间隔/开关变化需要重新下发配置
     ws::push_config(&st, id);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 列表拖动排序。前端把当前完整顺序整份发上来，比逐条 diff 好对账。
+#[derive(Deserialize)]
+pub struct ReorderReq {
+    pub ids: Vec<i64>,
+}
+
+pub async fn reorder(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Json(req): Json<ReorderReq>,
+) -> ApiResult<serde_json::Value> {
+    st.db.reorder_servers(&req.ids).map_err(internal)?;
+    // 顺序变了要让其他标签页跟着刷新；前端收到 servers_changed 会重新拉列表
+    st.ui_broadcast();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -336,7 +373,7 @@ pub async fn probes(
     st.db
         .get_server(id)
         .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
-    let bands = st.db.get_latency_bands_default();
+    let bands = BandResolver::load(&st);
     let views: Vec<ProbeView> = st
         .db
         .probes_for_server(id)
@@ -432,6 +469,7 @@ pub struct ExpiringInfo {
     pub expire_date: Option<String>,
     pub renew_price: f64,
     pub renew_cycle: RenewCycle,
+    pub currency: String,
 }
 
 pub async fn status(State(st): State<AppState>, _: crate::auth::AuthUser) -> ApiResult<StatusResp> {
@@ -452,6 +490,7 @@ pub async fn status(State(st): State<AppState>, _: crate::auth::AuthUser) -> Api
                     expire_date: s.expire_date.clone(),
                     renew_price: s.renew_price,
                     renew_cycle: s.renew_cycle,
+                    currency: s.currency.clone(),
                 });
             }
         }

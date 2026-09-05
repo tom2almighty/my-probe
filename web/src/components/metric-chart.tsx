@@ -15,7 +15,7 @@ import {
   YAxis,
 } from "recharts";
 import { Flag } from "@/components/flag";
-import { DEFAULT_BANDS, latencyColor, resolveBands } from "@/lib/latency";
+import { DEFAULT_BANDS, commonBands, latencyColor, resolveBands } from "@/lib/latency";
 import type { LatencyBand, MetricPoint, ProbePoint } from "@/lib/types";
 import { cn, fmtAxis, fmtBytes, fmtLatency, fmtPct, fmtTime, pct } from "@/lib/utils";
 
@@ -207,8 +207,12 @@ export function MetricChart({ data, series, height = 260, spanMs = 0 }: MetricCh
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+          {/* 时间按数值等比排布，断档才不会被压成一格；number 轴默认 domain 是 [0,'auto']，必须显式给 */}
           <XAxis
             dataKey="ts"
+            type="number"
+            scale="time"
+            domain={["dataMin", "dataMax"]}
             tickFormatter={(t: number) => fmtAxis(t, spanMs)}
             stroke="var(--border)"
             tick={{ fontSize: 11, fill: "var(--muted-foreground)" }}
@@ -413,8 +417,12 @@ export function ProbeChart({
       <ResponsiveContainer width="100%" height="100%">
         <ComposedChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+          {/* 时间按数值等比排布，断档才不会被压成一格；number 轴默认 domain 是 [0,'auto']，必须显式给 */}
           <XAxis
             dataKey="ts"
+            type="number"
+            scale="time"
+            domain={["dataMin", "dataMax"]}
             tickFormatter={(t: number) => fmtAxis(t, spanMs)}
             stroke="var(--border)"
             tick={{ fontSize: 11, fill: "var(--muted-foreground)" }}
@@ -530,6 +538,8 @@ export interface LatencySeries {
   /** 色序循环到第二轮以后用虚线区分，取自 seriesDash */
   dash?: string;
   rows: ProbePoint[];
+  /** 该线生效的阈值配色（后端已回退好）；用于背景带与提示框里的快慢着色 */
+  bands?: LatencyBand[];
 }
 
 /** 重采样后的一行：各线路的延迟均值 + 是否全线不通。 */
@@ -538,12 +548,29 @@ interface MultiRow {
   down: number;
   [key: string]: number | null;
 }
+/** 相邻样本时间差的中位数，即这条线实际的采样间隔（偶发缺样本不会带偏估计）。 */
+function sampleStep(rows: ProbePoint[]): number {
+  const steps: number[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const d = rows[i].ts - rows[i - 1].ts;
+    if (d > 0) steps.push(d);
+  }
+  if (steps.length === 0) return 0;
+  steps.sort((a, b) => a - b);
+  return steps[steps.length >> 1];
+}
+
 /**
  * 各探测的间隔不同、时间戳对不齐，先重采样到统一网格再画。
- * 桶内没有成功样本的线路留空（曲线断开），所有线路同时中断记为 down。
+ *
+ * 格宽必须宽于真实采样间隔：细了之后每格最多落进一条线的一个样本，其余线在这一行
+ * 没有值，`connectNulls={false}` 就把曲线打成了散点——1 小时范围格宽 22.5s、探测
+ * 间隔 60s 正是这个情况。乘 1.2 给探测抖动留余量，避免相邻样本偶尔跳过整格。
+ * 每行都为所有线路显式写值（没采到写 null），全部线路都探过且都失败才记 down。
  */
 function resample(series: LatencySeries[], from: number, to: number, buckets: number): MultiRow[] {
-  const width = Math.max(1_000, Math.ceil((to - from) / Math.max(1, buckets)));
+  const step = Math.max(0, ...series.map((s) => sampleStep(s.rows)));
+  const width = Math.max(1_000, Math.ceil((to - from) / Math.max(1, buckets)), Math.ceil(step * 1.2));
   const n = Math.max(1, Math.ceil((to - from) / width));
   const acc: Record<string, { sum: number; cnt: number }>[] = Array.from({ length: n }, () => ({}));
   for (const s of series) {
@@ -558,18 +585,22 @@ function resample(series: LatencySeries[], from: number, to: number, buckets: nu
       }
     }
   }
+  // 整段窗口都没数据的线路不参与「全线不通」判定，否则底色永远不会出现
+  const active = series.filter((s) => s.rows.length > 0).length;
   const out: MultiRow[] = [];
   for (let i = 0; i < n; i++) {
-    const keys = Object.keys(acc[i]);
-    if (keys.length === 0) continue; // 这一段没有任何样本，不画
+    const cells = acc[i];
+    if (Object.keys(cells).length === 0) continue; // 这一段没有任何样本，不画
     const row: MultiRow = { ts: Math.round(from + (i + 0.5) * width), down: 0 };
     let mute = 0;
-    for (const k of keys) {
-      const c = acc[i][k];
-      row[k] = c.cnt > 0 ? c.sum / c.cnt : null;
-      if (c.cnt === 0) mute++;
+    // 遍历 series 而不是本格出现过的键：没采到的线也要显式写 null，语义才明确
+    for (const s of series) {
+      const c = cells[s.key];
+      row[s.key] = c?.cnt ? c.sum / c.cnt : null;
+      if (c && c.cnt === 0) mute++;
     }
-    row.down = mute === keys.length ? 1 : 0;
+    // 只有「每条线都探过且都失败」才算整机不通，单条线挂掉不涂底色
+    row.down = active > 0 && mute === active ? 1 : 0;
     out.push(row);
   }
   return out;
@@ -593,14 +624,35 @@ export function LatencyMultiChart({
   smooth?: boolean;
 }) {
   const rows = useMemo(() => resample(series, from, to, buckets), [series, from, to, buckets]);
+  // 各线阈值不一致时背景带没有唯一含义，干脆不画，快慢只留在数字上
+  const shared = commonBands(series.map((s) => s.bands));
   if (rows.length === 0) return <EmptyChart />;
   return (
     <div style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
         <ComposedChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+          {/* 同 ProbeChart：ifOverflow=hidden 只裁剪不改 Y 轴范围 */}
+          {shared &&
+            bandAreas(shared).map((b) => (
+              <ReferenceArea
+                key={b.from}
+                yAxisId="ms"
+                y1={b.from}
+                y2={b.to}
+                fill={b.color}
+                fillOpacity={0.1}
+                stroke="none"
+                ifOverflow="hidden"
+                zIndex={-150}
+              />
+            ))}
+          {/* 同上，且固定成请求窗口：各线路采样对不齐也不会互相挤压 */}
           <XAxis
             dataKey="ts"
+            type="number"
+            scale="time"
+            domain={[from, to]}
             tickFormatter={(t: number) => fmtAxis(t, to - from)}
             stroke="var(--border)"
             tick={{ fontSize: 11, fill: "var(--muted-foreground)" }}
@@ -624,12 +676,18 @@ export function LatencyMultiChart({
               if (!active || !payload?.length) return null;
               const items = payload
                 .filter((p) => p.dataKey !== "down")
-                .map((p) => ({
-                  key: String(p.dataKey),
-                  label: series.find((s) => s.key === String(p.dataKey))?.label ?? String(p.dataKey),
-                  color: String(p.color),
-                  text: typeof p.value === "number" ? fmtLatency(p.value) : "丢包 / 无数据",
-                }));
+                .map((p) => {
+                  const s = series.find((x) => x.key === String(p.dataKey));
+                  const v = typeof p.value === "number" ? p.value : null;
+                  return {
+                    key: String(p.dataKey),
+                    label: s?.label ?? String(p.dataKey),
+                    color: String(p.color),
+                    // 阈值可能一线一套，快慢按各自的配色算
+                    tone: v == null ? null : latencyColor(s?.bands ?? DEFAULT_BANDS, v),
+                    text: v == null ? "丢包 / 无数据" : fmtLatency(v),
+                  };
+                });
               return (
                 <div className="rounded-lg border bg-background p-3 text-xs shadow-md">
                   <div className="mb-2 font-medium text-muted-foreground">{fmtTime(Number(label))}</div>
@@ -637,7 +695,9 @@ export function LatencyMultiChart({
                     <div key={it.key} className="flex items-center gap-2 py-0.5">
                       <span className="size-2 rounded-full" style={{ background: it.color }} />
                       <span className="text-muted-foreground">{it.label}</span>
-                      <span className="ml-auto font-semibold">{it.text}</span>
+                      <span className="ml-auto font-semibold" style={{ color: it.tone ?? undefined }}>
+                        {it.text}
+                      </span>
                     </div>
                   ))}
                 </div>

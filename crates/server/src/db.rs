@@ -9,8 +9,8 @@ use myprobe_shared::protocol::{ProbeProtocol, ProbeResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    AlertRules, LatencyBand, MetricPoint, NotifierConfig, Probe, ProbePoint, RenewCycle, Server, TrafficBump,
-    TrafficMode, TrafficPlan, TrafficUsage, default_latency_bands,
+    AlertRules, LatencyBand, LatencyScheme, MetricPoint, NotifierConfig, Probe, ProbePoint, RenewCycle,
+    Server, ServerAttrs, TrafficBump, TrafficMode, TrafficPlan, TrafficUsage, default_latency_bands,
 };
 
 pub struct Db {
@@ -42,7 +42,13 @@ CREATE TABLE IF NOT EXISTS servers (
     -- 计费口径：up / down / sum / max
     traffic_mode TEXT NOT NULL DEFAULT 'sum',
     -- 每月重置日 1-28，0 = 不重置
-    traffic_reset_day INTEGER NOT NULL DEFAULT 1
+    traffic_reset_day INTEGER NOT NULL DEFAULT 1,
+    -- 永不到期（自建 / 一次性买断），置 1 时忽略 expire_date
+    never_expire INTEGER NOT NULL DEFAULT 0,
+    -- 续费价格的币种，ISO 4217 三字母码
+    currency     TEXT NOT NULL DEFAULT 'CNY',
+    -- 列表手工排序，小的在前；相同时按 id
+    sort_order   INTEGER NOT NULL DEFAULT 0
 );
 
 -- 当前计费周期的流量累计。last_rx/last_tx 是上一次上报的累计读数，只用来做差分。
@@ -67,6 +73,15 @@ CREATE TABLE IF NOT EXISTS traffic_history (
     FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
 );
 
+-- 命名延迟配色方案：多个探测目标共用一套阈值，改方案就等于改所有引用它的目标。
+CREATE TABLE IF NOT EXISTS latency_schemes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    bands       TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
 -- 探测目标独立于服务器：一个探测可以派给任意多个客户端执行。
 CREATE TABLE IF NOT EXISTS probes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,8 +93,10 @@ CREATE TABLE IF NOT EXISTS probes (
     interval_s  INTEGER NOT NULL DEFAULT 60,
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
-    -- 延迟配色分段（JSON 数组）。NULL 表示跟随 settings.latency_bands_default
-    latency_bands TEXT
+    -- 延迟配色分段（JSON 数组）。NULL 表示往下回退到方案 / settings.latency_bands_default
+    latency_bands TEXT,
+    -- 引用的命名方案。方案删除时置空，于是自动回退到全局默认
+    latency_scheme_id INTEGER REFERENCES latency_schemes(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS probe_assignments (
@@ -120,7 +137,7 @@ CREATE INDEX IF NOT EXISTS idx_probe_result_probe ON probe_results(probe_id, ser
 /// servers 的完整列清单。三处查询共用，列序与 `row_to_server` 的下标一一对应。
 const SERVER_COLS: &str = "id, name, secret, country, note, enabled, expire_date,
      renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version,
-     traffic_limit_bytes, traffic_mode, traffic_reset_day";
+     traffic_limit_bytes, traffic_mode, traffic_reset_day, never_expire, currency";
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
@@ -138,7 +155,7 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         migrate_probes(&conn)?;
         migrate_servers(&conn)?;
-        migrate_probe_bands(&conn)?;
+        migrate_probe_cols(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -203,6 +220,59 @@ impl Db {
         self.set_setting("latency_bands_default", &serde_json::to_string(bands).unwrap())
     }
 
+    // ---------- 命名配色方案 ----------
+
+    /// 全部方案，按手工顺序（sort_order 相同再按 id）。
+    pub fn list_latency_schemes(&self) -> Vec<LatencyScheme> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c
+            .prepare("SELECT id, name, bands FROM latency_schemes ORDER BY sort_order, id")
+            .unwrap();
+        stmt.query_map([], row_to_scheme)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    pub fn get_latency_scheme(&self, id: i64) -> Option<LatencyScheme> {
+        let c = self.conn.lock().unwrap();
+        c.query_row(
+            "SELECT id, name, bands FROM latency_schemes WHERE id=?1",
+            params![id],
+            row_to_scheme,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// 新方案排在末尾：sort_order 取当前最大值 +1。
+    pub fn create_latency_scheme(&self, name: &str, bands: &[LatencyBand]) -> rusqlite::Result<i64> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO latency_schemes(name, bands, sort_order, created_at)
+             VALUES(?1, ?2, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM latency_schemes), ?3)",
+            params![name, serde_json::to_string(bands).unwrap(), Self::now_iso()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn update_latency_scheme(&self, id: i64, name: &str, bands: &[LatencyBand]) -> rusqlite::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE latency_schemes SET name=?2, bands=?3 WHERE id=?1",
+            params![id, name, serde_json::to_string(bands).unwrap()],
+        )?;
+        Ok(())
+    }
+
+    /// 删除方案。引用它的探测目标由外键置空，于是自动回退到全局默认。
+    pub fn delete_latency_scheme(&self, id: i64) -> rusqlite::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM latency_schemes WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
     pub fn get_notifiers(&self) -> Vec<NotifierConfig> {
         self.get_setting("notifiers")
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -218,7 +288,7 @@ impl Db {
     pub fn list_servers(&self) -> Vec<Server> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
-            .prepare(&format!("SELECT {SERVER_COLS} FROM servers ORDER BY id"))
+            .prepare(&format!("SELECT {SERVER_COLS} FROM servers ORDER BY sort_order, id"))
             .unwrap();
         stmt.query_map([], row_to_server)
             .unwrap()
@@ -250,79 +320,77 @@ impl Db {
         .flatten()
     }
 
-    // 建表字段逐个传入，比额外包一层 DTO 更直观；流量三件套总是一起变，打包成 TrafficPlan
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_server(
-        &self,
-        name: &str,
-        secret: &str,
-        country: &str,
-        note: &str,
-        expire_date: Option<&str>,
-        renew_price: f64,
-        renew_cycle: RenewCycle,
-        report_interval: i64,
-        traffic: TrafficPlan,
-    ) -> rusqlite::Result<i64> {
+    /// 新建机器。可编辑字段打包成 `ServerAttrs`（见 models.rs），十几个位置参数太容易错位。
+    /// `sort_order` 直接在 SQL 里取当前最大值 +1，新机器排在列表末尾，省一次查询。
+    pub fn create_server(&self, secret: &str, a: &ServerAttrs) -> rusqlite::Result<i64> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO servers(name, secret, country, note, expire_date, renew_price, renew_cycle, report_interval_s, created_at,
-                                 traffic_limit_bytes, traffic_mode, traffic_reset_day)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO servers(name, secret, country, note, expire_date, never_expire, currency,
+                                 renew_price, renew_cycle, report_interval_s, created_at,
+                                 traffic_limit_bytes, traffic_mode, traffic_reset_day, sort_order)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM servers))",
             params![
-                name,
+                a.name,
                 secret,
-                country,
-                note,
-                expire_date,
-                renew_price,
-                renew_cycle.as_str(),
-                report_interval,
+                a.country,
+                a.note,
+                a.expire_date,
+                a.never_expire as i64,
+                a.currency,
+                a.renew_price,
+                a.renew_cycle.as_str(),
+                a.report_interval_s as i64,
                 Self::now_iso(),
-                traffic.limit_bytes as i64,
-                traffic.mode.as_str(),
-                traffic.reset_day as i64
+                a.traffic.limit_bytes as i64,
+                a.traffic.mode.as_str(),
+                a.traffic.reset_day as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_server(
-        &self,
-        id: i64,
-        name: &str,
-        country: &str,
-        note: &str,
-        enabled: bool,
-        expire_date: Option<&str>,
-        renew_price: f64,
-        renew_cycle: RenewCycle,
-        report_interval: i64,
-        traffic: TrafficPlan,
-    ) -> rusqlite::Result<()> {
+    /// `enabled` 不在 `ServerAttrs` 里：新建时恒为启用，只有更新才会改它。
+    pub fn update_server(&self, id: i64, enabled: bool, a: &ServerAttrs) -> rusqlite::Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "UPDATE servers SET name=?1, country=?2, note=?3, enabled=?4,
-                    expire_date=?5, renew_price=?6, renew_cycle=?7, report_interval_s=?8,
-                    traffic_limit_bytes=?9, traffic_mode=?10, traffic_reset_day=?11
-             WHERE id=?12",
+            "UPDATE servers SET name=?1, country=?2, note=?3, enabled=?4, expire_date=?5,
+                    never_expire=?6, currency=?7, renew_price=?8, renew_cycle=?9,
+                    report_interval_s=?10, traffic_limit_bytes=?11, traffic_mode=?12,
+                    traffic_reset_day=?13
+             WHERE id=?14",
             params![
-                name,
-                country,
-                note,
+                a.name,
+                a.country,
+                a.note,
                 enabled as i64,
-                expire_date,
-                renew_price,
-                renew_cycle.as_str(),
-                report_interval,
-                traffic.limit_bytes as i64,
-                traffic.mode.as_str(),
-                traffic.reset_day as i64,
+                a.expire_date,
+                a.never_expire as i64,
+                a.currency,
+                a.renew_price,
+                a.renew_cycle.as_str(),
+                a.report_interval_s as i64,
+                a.traffic.limit_bytes as i64,
+                a.traffic.mode.as_str(),
+                a.traffic.reset_day as i64,
                 id
             ],
         )?;
         Ok(())
+    }
+
+    /// 按给定 id 顺序重排列表，一个事务写完，中途失败不会留下半套顺序。
+    /// 没出现在 ids 里的机器保持原值，由 `ORDER BY sort_order, id` 兜底。
+    pub fn reorder_servers(&self, ids: &[i64]) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE servers SET sort_order=?1 WHERE id=?2")?;
+            for (i, id) in ids.iter().enumerate() {
+                stmt.execute(params![i as i64 + 1, id])?;
+            }
+        }
+        tx.commit()
     }
 
     pub fn delete_server(&self, id: i64) -> rusqlite::Result<()> {
@@ -533,7 +601,8 @@ impl Db {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
             .prepare(
-                "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands
+                "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands,
+                        latency_scheme_id
                  FROM probes ORDER BY id",
             )
             .unwrap();
@@ -549,7 +618,7 @@ impl Db {
         let mut stmt = c
             .prepare(
                 "SELECT p.id, p.name, p.target, p.protocol, p.port, p.timeout_ms, p.interval_s, p.enabled,
-                        p.latency_bands
+                        p.latency_bands, p.latency_scheme_id
                  FROM probes p JOIN probe_assignments a ON a.probe_id = p.id
                  WHERE a.server_id = ?1 ORDER BY p.id",
             )
@@ -563,7 +632,8 @@ impl Db {
     pub fn get_probe(&self, id: i64) -> Option<Probe> {
         let c = self.conn.lock().unwrap();
         c.query_row(
-            "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands
+            "SELECT id, name, target, protocol, port, timeout_ms, interval_s, enabled, latency_bands,
+                    latency_scheme_id
              FROM probes WHERE id=?1",
             params![id],
             row_to_probe,
@@ -660,12 +730,13 @@ impl Db {
         interval_s: u64,
         enabled: bool,
         bands: Option<&[LatencyBand]>,
+        scheme_id: Option<i64>,
     ) -> rusqlite::Result<i64> {
         let c = self.conn.lock().unwrap();
         c.execute(
             "INSERT INTO probes(name, target, protocol, port, timeout_ms, interval_s, enabled, created_at,
-                                latency_bands)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                                latency_bands, latency_scheme_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 name,
                 target,
@@ -675,7 +746,8 @@ impl Db {
                 interval_s as i64,
                 enabled as i64,
                 Self::now_iso(),
-                bands_json(bands)
+                bands_json(bands),
+                scheme_id
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -693,11 +765,13 @@ impl Db {
         interval_s: u64,
         enabled: bool,
         bands: Option<&[LatencyBand]>,
+        scheme_id: Option<i64>,
     ) -> rusqlite::Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "UPDATE probes SET name=?1, target=?2, protocol=?3, port=?4,
-                    timeout_ms=?5, interval_s=?6, enabled=?7, latency_bands=?9 WHERE id=?8",
+            "UPDATE probes SET name=?1, target=?2, protocol=?3, port=?4, timeout_ms=?5, interval_s=?6,
+                    enabled=?7, latency_bands=?9, latency_scheme_id=?10
+             WHERE id=?8",
             params![
                 name,
                 target,
@@ -707,7 +781,8 @@ impl Db {
                 interval_s as i64,
                 enabled as i64,
                 id,
-                bands_json(bands)
+                bands_json(bands),
+                scheme_id
             ],
         )?;
         Ok(())
@@ -966,6 +1041,8 @@ fn row_to_server(r: &rusqlite::Row) -> rusqlite::Result<Server> {
             mode: TrafficMode::parse(&r.get::<_, String>(14)?),
             reset_day: r.get::<_, i64>(15)?.clamp(0, 28) as u32,
         },
+        never_expire: r.get::<_, i64>(16)? != 0,
+        currency: r.get(17)?,
         online: false,
     })
 }
@@ -1001,10 +1078,20 @@ fn row_to_probe(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
         timeout_ms: r.get::<_, i64>(5)? as u64,
         interval_s: r.get::<_, i64>(6)? as u64,
         enabled: r.get::<_, i64>(7)? != 0,
-        // 解析不出来就当没配（回退全局默认），不因为一行坏数据让整张列表报错
+        // 解析不出来就当没配（继续往下回退），不因为一行坏数据让整张列表报错
         latency_bands: r
             .get::<_, Option<String>>(8)?
             .and_then(|s| serde_json::from_str(&s).ok()),
+        latency_scheme_id: r.get(9)?,
+    })
+}
+
+/// bands 解析不出来就当空数组：配色解析会继续往下回退，坏数据不至于挡住整张方案列表。
+fn row_to_scheme(r: &rusqlite::Row) -> rusqlite::Result<LatencyScheme> {
+    Ok(LatencyScheme {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        bands: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
     })
 }
 
@@ -1032,14 +1119,33 @@ fn migrate_servers(conn: &Connection) -> rusqlite::Result<()> {
              ALTER TABLE servers ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1;",
         )?;
     }
+    // 三列一起加：都是这一版新增的资产字段，一步迁移少一次 PRAGMA 探测
+    if !has_column(conn, "servers", "sort_order")? {
+        tracing::info!("迁移数据库：servers 增加 never_expire / currency / sort_order 列");
+        conn.execute_batch(
+            "ALTER TABLE servers ADD COLUMN never_expire INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE servers ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY';
+             ALTER TABLE servers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+             -- 老库没有手工顺序，按 id 铺一遍，保持迁移前后的列表顺序一致
+             UPDATE servers SET sort_order = id WHERE sort_order = 0;",
+        )?;
+    }
     Ok(())
 }
 
 /// probes 表的加列式迁移。放在 migrate_probes 之后跑：老库先重建成新结构，再补列。
-fn migrate_probe_bands(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_probe_cols(conn: &Connection) -> rusqlite::Result<()> {
     if !has_column(conn, "probes", "latency_bands")? {
         tracing::info!("迁移数据库：probes 增加 latency_bands 列");
         conn.execute_batch("ALTER TABLE probes ADD COLUMN latency_bands TEXT")?;
+    }
+    // 带 REFERENCES 的加列只允许默认 NULL，正好就是「没引用方案」的含义
+    if !has_column(conn, "probes", "latency_scheme_id")? {
+        tracing::info!("迁移数据库：probes 增加 latency_scheme_id 列");
+        conn.execute_batch(
+            "ALTER TABLE probes ADD COLUMN latency_scheme_id INTEGER
+             REFERENCES latency_schemes(id) ON DELETE SET NULL",
+        )?;
     }
     Ok(())
 }

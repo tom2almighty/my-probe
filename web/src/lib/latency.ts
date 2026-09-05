@@ -37,6 +37,21 @@ export function resolveBands(
   return bands && bands.length > 0 ? bands : fallback;
 }
 
+/**
+ * 一组线路的公共配色：全部一致时返回它，否则返回 null。
+ *
+ * 多条线放在一张图里，只有大家的快慢阈值相同，背景色带才有唯一含义；
+ * 阈值不同就别画背景，让快慢只体现在数字上，免得看图的人误读。
+ */
+export function commonBands(list: (LatencyBand[] | null | undefined)[]): LatencyBand[] | null {
+  if (list.length === 0) return null;
+  const first = resolveBands(list[0]);
+  const same = (b: LatencyBand[]) =>
+    b.length === first.length &&
+    b.every((x, i) => x.color === first[i].color && (x.max_ms ?? null) === (first[i].max_ms ?? null));
+  return list.every((b) => same(resolveBands(b))) ? first : null;
+}
+
 /** 保证最后一段没有上限：编辑器增删行之后调用，维持「末段兜底」的约定。 */
 export function normalizeBands(bands: LatencyBand[]): LatencyBand[] {
   return bands.map((b, i) =>

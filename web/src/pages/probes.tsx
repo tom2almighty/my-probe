@@ -9,6 +9,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  SwatchBook,
   Trash2,
   Users,
   Waypoints,
@@ -43,11 +44,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
-import { DEFAULT_BANDS, validateBands } from "@/lib/latency";
-import type { LatencyBand, ProbeItem, Server } from "@/lib/types";
+import { DEFAULT_BANDS, bandsGradient, bandsLabel, validateBands } from "@/lib/latency";
+import type { LatencyBand, LatencyScheme, ProbeItem, Server } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type Filter = "all" | "enabled" | "paused";
@@ -56,6 +58,7 @@ export default function ProbesPage() {
   const { data, loading, reload, setData } = useAsync<ProbeItem[]>(() => api.probes(), []);
   const servers = useAsync<Server[]>(() => api.servers(), []);
   const bands = useAsync<LatencyBand[]>(() => api.latencyBands(), []);
+  const schemes = useAsync<LatencyScheme[]>(() => api.latencySchemes(), []);
   const onError = useErrorHandler();
 
   const [q, setQ] = useState("");
@@ -63,6 +66,7 @@ export default function ProbesPage() {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [bandsOpen, setBandsOpen] = useState(false);
+  const [schemesOpen, setSchemesOpen] = useState(false);
   const [editing, setEditing] = useState<EditingProbe | null>(null);
   const [assigning, setAssigning] = useState<ProbeItem | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProbeItem | null>(null);
@@ -93,6 +97,7 @@ export default function ProbesPage() {
     } else if (e.type === "servers_changed") {
       reload();
       servers.reload();
+      schemes.reload();
     }
   });
 
@@ -189,6 +194,9 @@ export default function ProbesPage() {
             共 {data?.length ?? 0} 个目标，{busyServers} 台客户端在执行
           </p>
         </div>
+        <Button variant="outline" size="sm" onClick={() => setSchemesOpen(true)}>
+          <SwatchBook className="size-4" /> 配色方案
+        </Button>
         <Button variant="outline" size="sm" onClick={() => setBandsOpen(true)}>
           <Palette className="size-4" /> 默认配色
         </Button>
@@ -280,7 +288,19 @@ export default function ProbesPage() {
         probe={editing}
         servers={servers.data ?? []}
         defaultBands={bands.data ?? DEFAULT_BANDS}
+        schemes={schemes.data ?? []}
         onSubmit={save}
+      />
+
+      <SchemesDialog
+        open={schemesOpen}
+        onOpenChange={setSchemesOpen}
+        schemes={schemes.data ?? []}
+        defaultBands={bands.data ?? DEFAULT_BANDS}
+        onChanged={() => {
+          schemes.reload();
+          reload();
+        }}
       />
 
       <DefaultBandsDialog
@@ -475,6 +495,154 @@ function DefaultBandsDialog({
           <Button type="button" disabled={saving} onClick={submit}>
             {saving ? "保存中…" : "保存"}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * 命名配色方案：同类线路（优化 / 不优化、跨洋 / 同城）共用一套阈值。
+ *
+ * 列表与编辑共用这一个弹窗（`draft` 非空即编辑态），避免嵌套 Dialog 抢焦点。
+ */
+function SchemesDialog({
+  open,
+  onOpenChange,
+  schemes,
+  defaultBands,
+  onChanged,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  schemes: LatencyScheme[];
+  defaultBands: LatencyBand[];
+  onChanged: () => void;
+}) {
+  /** null = 列表态；`id` 为 null 表示正在新建 */
+  const [draft, setDraft] = useState<{ id: number | null; name: string; bands: LatencyBand[] } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const onError = useErrorHandler();
+
+  useEffect(() => {
+    if (open) setDraft(null);
+  }, [open]);
+
+  const submit = async () => {
+    if (!draft) return;
+    const name = draft.name.trim();
+    if (!name) return toast.error("请填写方案名称");
+    const bad = validateBands(draft.bands);
+    if (bad) return toast.error(bad);
+    setSaving(true);
+    try {
+      if (draft.id == null) await api.createLatencyScheme(name, draft.bands);
+      else await api.updateLatencyScheme(draft.id, name, draft.bands);
+      toast.success("已保存");
+      setDraft(null);
+      onChanged();
+    } catch (e) {
+      onError(e, "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (s: LatencyScheme) => {
+    try {
+      await api.deleteLatencyScheme(s.id);
+      toast.success(`已删除「${s.name}」`);
+      onChanged();
+    } catch (e) {
+      onError(e, "删除失败");
+    }
+  };
+
+  const title = draft ? (draft.id == null ? "新建配色方案" : "编辑配色方案") : "配色方案";
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>
+            一套阈值给多个探测目标共用，改方案就等于改所有引用它的目标。
+            删除方案后，引用它的目标回退到全局默认。
+          </DialogDescription>
+        </DialogHeader>
+
+        {draft ? (
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="ls-name">方案名称</Label>
+              <Input
+                id="ls-name"
+                value={draft.name}
+                maxLength={24}
+                placeholder="优化线路"
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              />
+            </div>
+            <BandsEditor value={draft.bands} onChange={(b) => setDraft({ ...draft, bands: b })} />
+          </div>
+        ) : schemes.length === 0 ? (
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            还没有方案。建一个「优化线路」、一个「不优化」，之后在探测目标里选就行
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {schemes.map((s) => (
+              <div key={s.id} className="flex items-center gap-2 rounded-lg border p-2.5">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{s.name}</p>
+                  <p className="text-[11px] text-muted-foreground">{bandsLabel(s.bands)}</p>
+                  <div className="mt-1.5 h-1.5 rounded-full" style={{ background: bandsGradient(s.bands) }} />
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="编辑"
+                  onClick={() => setDraft({ id: s.id, name: s.name, bands: s.bands.map((b) => ({ ...b })) })}
+                >
+                  <Pencil className="size-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="删除"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => remove(s)}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <DialogFooter>
+          {draft ? (
+            <>
+              <Button type="button" variant="outline" onClick={() => setDraft(null)}>
+                取消
+              </Button>
+              <Button type="button" disabled={saving} onClick={submit}>
+                {saving ? "保存中…" : "保存"}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+                关闭
+              </Button>
+              <Button
+                type="button"
+                onClick={() => setDraft({ id: null, name: "", bands: defaultBands.map((b) => ({ ...b })) })}
+              >
+                <Plus className="size-4" /> 新建方案
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -29,7 +29,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, usePublicEvents } from "@/lib/hooks";
-import { latencyColor } from "@/lib/latency";
+import { commonBands, latencyColor } from "@/lib/latency";
 import { modeLabel, resetText, trafficText, withLiveUsed } from "@/lib/traffic";
 import type { MetricPoint, ProbeItem, ProbePoint, PublicOverview } from "@/lib/types";
 import { fmtBytes, fmtLatency, fmtPct, fmtTime, pct, uptimeText } from "@/lib/utils";
@@ -108,9 +108,14 @@ export default function PublicServerPage() {
         color: seriesColor(i),
         dash: seriesDash(i),
         rows: histories.data?.rows[i] ?? [],
+        bands: p.bands,
       })),
     [probes, histories.data],
   );
+
+  // 这张图里一条线一个探测目标，各自的阈值可能来自不同配色方案：
+  // 阈值不一致时图表不画背景色带，这里顺手说明一句，免得以为是漏了
+  const mixedBands = commonBands(probes.map((p) => p.bands)) == null;
 
   if (!srv) {
     return (
@@ -232,7 +237,11 @@ export default function PublicServerPage() {
               </div>
             ) : (
               <>
-                <ChartBlock title="延迟对比" legend={latency}>
+                <ChartBlock
+                  title="延迟对比"
+                  legend={latency}
+                  hint={mixedBands ? "各目标阈值不同，未画背景色带" : undefined}
+                >
                   <LatencyMultiChart
                     series={latency}
                     from={histories.data?.from ?? Date.now() - cfg.ms}

@@ -90,15 +90,10 @@ export function LatencyPanel({
   const smoothId = `smooth-${useId()}`;
   const cfg = span ?? METRIC_RANGES.find((r) => r.key === range) ?? METRIC_RANGES[0];
 
-  // 默认选择：节点不多就全选，多了只取按名称排序的前几个，避免首屏发十几个请求
-  const fallbackIds = useMemo(
-    () =>
-      [...targets]
-        .sort((a, b) => a.server_name.localeCompare(b.server_name, "zh-Hans-CN"))
-        .slice(0, DEFAULT_PICK)
-        .map((t) => t.server_id),
-    [targets],
-  );
+  // 默认选择：节点不多就全选，多了只取前几个，避免首屏发十几个请求。
+  // 顺序直接跟着主控给的 targets（即服务器列表的手工排序），不再按名称重排——
+  // 列表既然能拖，「前几个」就该是用户自己排在前面的那几台
+  const fallbackIds = useMemo(() => targets.slice(0, DEFAULT_PICK).map((t) => t.server_id), [targets]);
 
   // 勾选集按 targets 顺序整理，并剔除已经不在指派列表里的节点；至少留一个
   const picked = useMemo(() => {
@@ -145,8 +140,10 @@ export function LatencyPanel({
         color: c.color,
         dash: c.dash,
         rows: c.rows,
+        // 同一个探测目标的多台机器，阈值当然一致，背景带能照常画
+        bands,
       })),
-    [compare],
+    [compare, bands],
   );
 
   const legend = useMemo<LegendItem[]>(

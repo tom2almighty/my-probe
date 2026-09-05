@@ -19,6 +19,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { COUNTRIES } from "@/lib/countries";
+import { CURRENCIES, DEFAULT_CURRENCY } from "@/lib/money";
 import { TRAFFIC_UNITS, type TrafficUnit, splitLimit, toBytes } from "@/lib/traffic";
 import {
   RENEW_CYCLE_LABELS,
@@ -40,8 +41,10 @@ function initial(server?: Server | null): ServerFormValue {
     note: server?.note ?? "",
     enabled: server?.enabled ?? true,
     expire_date: server?.expire_date ?? null,
+    never_expire: server?.never_expire ?? false,
     renew_price: server?.renew_price ?? 0,
     renew_cycle: server?.renew_cycle ?? "month",
+    currency: server?.currency ?? DEFAULT_CURRENCY,
     report_interval_s: server?.report_interval_s ?? 5,
     traffic_limit_bytes: server?.traffic.limit ?? 0,
     traffic_mode: server?.traffic.mode ?? "sum",
@@ -74,6 +77,20 @@ export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props
 
   const set = <K extends keyof ServerFormValue>(k: K, val: ServerFormValue[K]) =>
     setV((s) => ({ ...s, [k]: val }));
+
+  const free = v.renew_cycle === "free";
+
+  // 「永不到期」与日期互斥，「免费」与价格互斥：两处都在提交前后端也会再规范化一次，
+  // 这里同步清掉是为了让界面上看到的就是最终会存下去的东西
+  const setNever = (on: boolean) =>
+    setV((s) => ({ ...s, never_expire: on, expire_date: on ? null : s.expire_date }));
+
+  const setCycle = (c: string) =>
+    setV((s) => ({
+      ...s,
+      renew_cycle: c as RenewCycle,
+      renew_price: c === "free" ? 0 : s.renew_price,
+    }));
 
   const setLimitFields = (value: number, unit: TrafficUnit) => {
     setLimit({ value, unit });
@@ -161,24 +178,41 @@ export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props
               <Input
                 id="sf-expire"
                 type="date"
+                disabled={v.never_expire}
                 value={v.expire_date ?? ""}
                 onChange={(e) => set("expire_date", e.target.value || null)}
               />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="sf-price">续费价格</Label>
-              <Input
-                id="sf-price"
-                type="number"
-                min={0}
-                step="0.01"
-                value={v.renew_price}
-                onChange={(e) => set("renew_price", Number(e.target.value) || 0)}
-              />
+              {/* 价格与币种同一格：和下面「限额 + 单位」一样的写法 */}
+              <div className="flex gap-2">
+                <Input
+                  id="sf-price"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  disabled={free}
+                  value={v.renew_price}
+                  onChange={(e) => set("renew_price", Number(e.target.value) || 0)}
+                />
+                <Select value={v.currency} onValueChange={(c) => set("currency", c)} disabled={free}>
+                  <SelectTrigger className="w-[92px] shrink-0" aria-label="币种">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CURRENCIES.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="sf-cycle">续费周期</Label>
-              <Select value={v.renew_cycle} onValueChange={(c) => set("renew_cycle", c as RenewCycle)}>
+              <Select value={v.renew_cycle} onValueChange={setCycle}>
                 <SelectTrigger id="sf-cycle">
                   <SelectValue />
                 </SelectTrigger>
@@ -193,27 +227,33 @@ export function ServerFormDialog({ open, onOpenChange, server, onSubmit }: Props
             </div>
           </div>
 
-          {!v.expire_date && (
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              快速填充：
-              {[
-                ["1 个月", 30],
-                ["3 个月", 90],
-                ["半年", 182],
-                ["1 年", 365],
-              ].map(([label, days]) => (
-                <Button
-                  key={label}
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => set("expire_date", dateAfter(days as number))}
-                >
-                  {label}
-                </Button>
-              ))}
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <Switch id="sf-never" checked={v.never_expire} onCheckedChange={setNever} />
+            <Label htmlFor="sf-never" className="text-xs font-normal text-muted-foreground">
+              永不到期
+            </Label>
+            {!v.never_expire && !v.expire_date && (
+              <>
+                <span className="ml-2">快速填充：</span>
+                {[
+                  ["1 个月", 30],
+                  ["3 个月", 90],
+                  ["半年", 182],
+                  ["1 年", 365],
+                ].map(([label, days]) => (
+                  <Button
+                    key={label}
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => set("expire_date", dateAfter(days as number))}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </>
+            )}
+          </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">

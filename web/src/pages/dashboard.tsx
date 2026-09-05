@@ -122,7 +122,7 @@ export default function DashboardPage() {
                 <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
                 <span className="text-xs text-muted-foreground">{s.expire_date ?? "—"}</span>
                 <div className="ml-auto">
-                  <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+                  <RenewInfo price={s.renew_price} cycle={s.renew_cycle} currency={s.currency} />
                 </div>
               </div>
             ))}
@@ -206,8 +206,8 @@ function ServerCard({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs">
-          <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
-          <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+          <ExpireBadge days={s.days_to_expire} date={s.expire_date} neverExpire={s.never_expire} />
+          <RenewInfo price={s.renew_price} cycle={s.renew_cycle} currency={s.currency} />
           <span className="ml-auto text-muted-foreground">
             {online
               ? m

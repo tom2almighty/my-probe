@@ -57,7 +57,10 @@ pub fn protected_router() -> Router<AppState> {
     Router::new()
         .route("/api/me", get(auth::me))
         .route("/api/change-password", post(auth::change_password))
+        .route("/api/change-username", post(auth::change_username))
         .route("/api/servers", get(servers::list).post(servers::create))
+        // 放在 {id} 之前只是为了读起来顺；静态段本来就比路径参数优先匹配
+        .route("/api/servers/reorder", put(servers::reorder))
         .route(
             "/api/servers/{id}",
             get(servers::detail).put(servers::update).delete(servers::destroy),
@@ -73,6 +76,14 @@ pub fn protected_router() -> Router<AppState> {
         .route(
             "/api/latency-bands",
             get(probes::bands_default).put(probes::set_bands_default),
+        )
+        .route(
+            "/api/latency-schemes",
+            get(probes::schemes).post(probes::create_scheme),
+        )
+        .route(
+            "/api/latency-schemes/{sid}",
+            put(probes::update_scheme).delete(probes::destroy_scheme),
         )
         .route("/api/probes/{pid}", put(probes::update).delete(probes::destroy))
         .route("/api/probes/{pid}/servers", put(probes::assign))

@@ -1,4 +1,4 @@
-//! 登录、当前用户、改密。
+//! 登录、当前用户、改密改名。
 
 use axum::Json;
 use axum::extract::State;
@@ -83,6 +83,38 @@ pub async fn change_password(
         .set_setting("admin_password_hash", &new_hash)
         .map_err(|e| ApiErr::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeUsernameReq {
+    pub password: String,
+    pub username: String,
+}
+
+/// 改用户名。要验当前密码：拿到一个没退出的会话就能改掉登录身份太危险。
+/// 鉴权只看 JWT 里的 sub、不比对用户名，所以改完当前会话不会掉线，下次登录用新名字。
+pub async fn change_username(
+    State(st): State<AppState>,
+    _user: AuthUser,
+    Json(req): Json<ChangeUsernameReq>,
+) -> ApiResult<MeResp> {
+    let name = req.username.trim().to_string();
+    let len = name.chars().count();
+    if !(3..=32).contains(&len) {
+        return Err(err(StatusCode::BAD_REQUEST, "用户名长度需为 3-32 个字符"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+        return Err(err(StatusCode::BAD_REQUEST, "用户名只能包含字母、数字与 _ . -"));
+    }
+    let hash = admin_password_hash(&st.db);
+    if !verify_password(&req.password, &hash) {
+        return Err(err(StatusCode::BAD_REQUEST, "密码错误"));
+    }
+    st.db
+        .set_setting("admin_username", &name)
+        .map_err(|e| ApiErr::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(username = %name, "管理员用户名已修改");
+    Ok(Json(MeResp { username: name }))
 }
 
 fn admin_username(db: &Db) -> String {

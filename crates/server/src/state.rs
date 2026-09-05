@@ -245,8 +245,12 @@ pub struct ServerView {
     pub note: String,
     pub enabled: bool,
     pub expire_date: Option<String>,
+    /// 永不到期：前端据此显示「永久」而不是空值。
+    pub never_expire: bool,
     pub renew_price: f64,
     pub renew_cycle: models::RenewCycle,
+    /// 续费价格的币种，ISO 4217 三字母码。
+    pub currency: String,
     pub report_interval_s: u64,
     pub created_at: String,
     pub last_seen: i64,
@@ -318,8 +322,10 @@ pub fn server_view(
         note: s.note.clone(),
         enabled: s.enabled,
         expire_date: s.expire_date.clone(),
+        never_expire: s.never_expire,
         renew_price: s.renew_price,
         renew_cycle: s.renew_cycle,
+        currency: s.currency.clone(),
         report_interval_s: s.report_interval_s,
         created_at: s.created_at.to_rfc3339(),
         last_seen: s.last_seen,

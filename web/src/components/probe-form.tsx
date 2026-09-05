@@ -17,9 +17,17 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { DEFAULT_BANDS, bandsGradient, bandsLabel, validateBands } from "@/lib/latency";
-import type { LatencyBand, Probe, Protocol, Server } from "@/lib/types";
+import type { LatencyBand, LatencyScheme, Probe, Protocol, Server } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export interface ProbeFormValue {
@@ -32,8 +40,10 @@ export interface ProbeFormValue {
   enabled: boolean;
   /** 执行该探测的客户端 */
   server_ids: number[];
-  /** null = 跟随全局默认配色 */
+  /** 自定义分段；null = 往下看方案 */
   latency_bands: LatencyBand[] | null;
+  /** 引用的命名方案；null = 跟随全局默认。与 latency_bands 互斥 */
+  latency_scheme_id: number | null;
 }
 
 /** 编辑时传入的探测目标（带已指派的客户端）。 */
@@ -50,6 +60,7 @@ function initial(probe?: EditingProbe | null, defaults?: number[]): ProbeFormVal
     enabled: probe?.enabled ?? true,
     server_ids: probe?.server_ids ?? defaults ?? [],
     latency_bands: probe?.latency_bands ?? null,
+    latency_scheme_id: probe?.latency_scheme_id ?? null,
   };
 }
 
@@ -64,6 +75,8 @@ interface Props {
   defaultServerIds?: number[];
   /** 全局默认配色，用于「跟随默认」时的预览与切自定义时的起始值 */
   defaultBands?: LatencyBand[];
+  /** 可选的命名配色方案 */
+  schemes?: LatencyScheme[];
   onSubmit: (v: ProbeFormValue) => Promise<void>;
 }
 
@@ -74,6 +87,7 @@ export function ProbeFormDialog({
   servers,
   defaultServerIds,
   defaultBands = DEFAULT_BANDS,
+  schemes = [],
   onSubmit,
 }: Props) {
   const [v, setV] = useState<ProbeFormValue>(() => initial(probe, defaultServerIds));
@@ -99,6 +113,21 @@ export function ProbeFormDialog({
       server_ids: s.server_ids.includes(id) ? s.server_ids.filter((x) => x !== id) : [...s.server_ids, id],
     }));
 
+  // 配色三选一：跟随全局默认 / 引用方案 / 自定义分段。自定义优先级最高，
+  // 所以切到方案时必须把 latency_bands 清掉，否则方案看着生效其实没生效。
+  const scheme = schemes.find((x) => x.id === v.latency_scheme_id);
+  const preview = scheme?.bands ?? defaultBands;
+  const bandsMode = v.latency_bands ? "__custom" : scheme ? String(scheme.id) : "__default";
+  const setBandsMode = (mode: string) => {
+    if (mode === "__custom") {
+      // 拿当前预览的那套当起始值，免得从空白开始调
+      setV((s) => ({ ...s, latency_bands: preview.map((b) => ({ ...b })), latency_scheme_id: null }));
+    } else {
+      const id = mode === "__default" ? null : Number(mode);
+      setV((s) => ({ ...s, latency_bands: null, latency_scheme_id: id }));
+    }
+  };
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!v.name.trim()) return toast.error("请填写探测名称");
@@ -120,6 +149,7 @@ export function ProbeFormDialog({
         name: v.name.trim(),
         target: v.target.trim(),
         port: v.protocol === "tcp" ? v.port : null,
+        latency_scheme_id: v.latency_bands ? null : v.latency_scheme_id,
       });
       onOpenChange(false);
     } finally {
@@ -307,26 +337,32 @@ export function ProbeFormDialog({
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {v.latency_bands
                     ? "只对该目标生效，用于图表背景带与延迟数字"
-                    : `跟随全局默认（${bandsLabel(defaultBands)}）`}
+                    : scheme
+                      ? `方案「${scheme.name}」（${bandsLabel(scheme.bands)}），改方案会连带改掉别的目标`
+                      : `跟随全局默认（${bandsLabel(defaultBands)}）`}
                 </p>
               </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                <Switch
-                  id={bandsId}
-                  checked={!!v.latency_bands}
-                  onCheckedChange={(c) =>
-                    set("latency_bands", c ? defaultBands.map((b) => ({ ...b })) : null)
-                  }
-                />
-                <Label htmlFor={bandsId} className="cursor-pointer text-xs text-muted-foreground">
-                  自定义
-                </Label>
-              </div>
+              <Select value={bandsMode} onValueChange={setBandsMode}>
+                <SelectTrigger id={bandsId} className="w-[150px] shrink-0">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__default">跟随全局默认</SelectItem>
+                  {schemes.length > 0 && <SelectSeparator />}
+                  {schemes.map((x) => (
+                    <SelectItem key={x.id} value={String(x.id)}>
+                      {x.name}
+                    </SelectItem>
+                  ))}
+                  <SelectSeparator />
+                  <SelectItem value="__custom">自定义分段</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             {v.latency_bands ? (
               <BandsEditor value={v.latency_bands} onChange={(b) => set("latency_bands", b)} />
             ) : (
-              <div className="h-2 rounded-full" style={{ background: bandsGradient(defaultBands) }} />
+              <div className="h-2 rounded-full" style={{ background: bandsGradient(preview) }} />
             )}
           </div>
 

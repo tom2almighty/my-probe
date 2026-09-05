@@ -1,10 +1,11 @@
-//! API 客户端。前端带 `?mock` 或 VITE_MOCK=1 时走本地 mock，无需后端。
+//! API 客户端。开发时带 `?mock`（或 VITE_MOCK=1 构建）走本地 mock，无需后端。
 
 import { DEFAULT_BANDS, resolveBands } from "./latency";
 import {
   type MockProbe,
   type MockServer,
   mockAlertRules,
+  mockLatencySchemes,
   mockMetricSeries,
   mockNotifiers,
   mockProbeSeries,
@@ -20,6 +21,7 @@ import type {
   AlertRules,
   CreateServerResp,
   LatencyBand,
+  LatencyScheme,
   LoginResp,
   MetricPoint,
   NotifierConfig,
@@ -48,8 +50,17 @@ export function setToken(t: string | null) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
+/**
+ * mock 只在开发期由 `?mock` 打开：`import.meta.env.DEV` 是编译期常量，生产构建里整个
+ * 判断折叠成 false——线上没法用一个查询参数把界面顶成假数据，mock 分支也能被摇掉。
+ * 需要发一份纯演示站时用 VITE_MOCK=1 构建，那是显式选择。
+ */
+const MOCK =
+  (import.meta.env.DEV && new URLSearchParams(window.location.search).has("mock")) ||
+  import.meta.env.VITE_MOCK === "1";
+
 export function isMock(): boolean {
-  return new URLSearchParams(window.location.search).has("mock") || import.meta.env.VITE_MOCK === "1";
+  return MOCK;
 }
 
 export class AuthError extends Error {}
@@ -114,7 +125,7 @@ const wsProto = () => (location.protocol === "https:" ? "wss" : "ws");
 
 /** 后台实时事件源（需要登录）。 */
 export function connectUiWs(onEvent: (e: UiEvent) => void): () => void {
-  if (isMock()) return subscribeMockEvents(onEvent);
+  if (MOCK) return subscribeMockEvents(onEvent);
   const token = getToken();
   if (!token) return () => {};
   return connectWs(() => `${wsProto()}://${location.host}/ws/ui?token=${encodeURIComponent(token)}`, onEvent);
@@ -122,7 +133,7 @@ export function connectUiWs(onEvent: (e: UiEvent) => void): () => void {
 
 /** 公开视图实时事件源（无需登录）。 */
 export function connectPublicWs(onEvent: (e: UiEvent) => void): () => void {
-  if (isMock()) return subscribeMockEvents(onEvent);
+  if (MOCK) return subscribeMockEvents(onEvent);
   return connectWs(() => `${wsProto()}://${location.host}/ws/public`, onEvent);
 }
 
@@ -130,12 +141,16 @@ export interface ApiClient {
   login(u: string, p: string): Promise<LoginResp>;
   me(): Promise<{ username: string }>;
   changePassword(oldP: string, newP: string): Promise<void>;
+  /** 改管理员用户名，需当前密码；返回改后的名字 */
+  changeUsername(password: string, username: string): Promise<{ username: string }>;
   status(): Promise<StatusResp>;
   servers(): Promise<Server[]>;
   server(id: number): Promise<ServerDetail>;
   createServer(body: ServerInput): Promise<CreateServerResp>;
   updateServer(id: number, body: ServerInput): Promise<void>;
   deleteServer(id: number): Promise<void>;
+  /** 列表拖动排序：把当前完整顺序整份提交 */
+  reorderServers(ids: number[]): Promise<void>;
   rotateSecret(id: number): Promise<{ secret: string }>;
   /** 手动校正本周期流量；`usedBytes` 省略表示归零 */
   resetTraffic(id: number, usedBytes?: number): Promise<{ traffic: Traffic }>;
@@ -152,6 +167,11 @@ export interface ApiClient {
   /** 全局默认延迟配色（未单独配置的探测目标都跟着它） */
   latencyBands(): Promise<LatencyBand[]>;
   saveLatencyBands(bands: LatencyBand[]): Promise<void>;
+  /** 命名配色方案：同一套阈值给多个探测目标共用 */
+  latencySchemes(): Promise<LatencyScheme[]>;
+  createLatencyScheme(name: string, bands: LatencyBand[]): Promise<LatencyScheme>;
+  updateLatencyScheme(id: number, name: string, bands: LatencyBand[]): Promise<void>;
+  deleteLatencyScheme(id: number): Promise<void>;
   metrics(id: number, sinceMs?: number, points?: number): Promise<MetricPoint[]>;
   probeHistory(pid: number, serverId: number | null, sinceMs: number, points?: number): Promise<ProbePoint[]>;
   alerts(): Promise<AlertRules>;
@@ -187,6 +207,8 @@ const realApi: ApiClient = {
       method: "POST",
       body: JSON.stringify({ old_password: oldP, new_password: newP }),
     }).then(() => undefined),
+  changeUsername: (password, username) =>
+    request("/api/change-username", { method: "POST", body: JSON.stringify({ password, username }) }),
   status: () => request("/api/status"),
   servers: () => request("/api/servers"),
   server: (id) => request(`/api/servers/${id}`),
@@ -194,6 +216,8 @@ const realApi: ApiClient = {
   updateServer: (id, body) =>
     request(`/api/servers/${id}`, { method: "PUT", body: JSON.stringify(body) }).then(() => undefined),
   deleteServer: (id) => request(`/api/servers/${id}`, { method: "DELETE" }).then(() => undefined),
+  reorderServers: (ids) =>
+    request("/api/servers/reorder", { method: "PUT", body: JSON.stringify({ ids }) }).then(() => undefined),
   rotateSecret: (id) => request(`/api/servers/${id}/rotate-secret`, { method: "POST" }),
   resetTraffic: (id, usedBytes) =>
     request(`/api/servers/${id}/traffic/reset`, {
@@ -219,6 +243,15 @@ const realApi: ApiClient = {
   latencyBands: () => request("/api/latency-bands"),
   saveLatencyBands: (bands) =>
     request("/api/latency-bands", { method: "PUT", body: JSON.stringify(bands) }).then(() => undefined),
+  latencySchemes: () => request("/api/latency-schemes"),
+  createLatencyScheme: (name, bands) =>
+    request("/api/latency-schemes", { method: "POST", body: JSON.stringify({ name, bands }) }),
+  updateLatencyScheme: (id, name, bands) =>
+    request(`/api/latency-schemes/${id}`, { method: "PUT", body: JSON.stringify({ name, bands }) }).then(
+      () => undefined,
+    ),
+  deleteLatencyScheme: (id) =>
+    request(`/api/latency-schemes/${id}`, { method: "DELETE" }).then(() => undefined),
   metrics: (id, sinceMs, points) => request(`/api/servers/${id}/metrics${qs({ since_ms: sinceMs, points })}`),
   probeHistory: (pid, serverId, sinceMs, points) =>
     request(`/api/probes/${pid}/history${qs({ since_ms: sinceMs, points, server_id: serverId })}`),
@@ -239,12 +272,14 @@ const realApi: ApiClient = {
 // ---- mock 实现（内存态，支持增删改，刷新后重置） ----
 
 const state = {
+  username: "admin",
   servers: mockServers.map((s) => structuredClone(s)) as MockServer[],
   probes: mockProbes.map((p) => structuredClone(p)) as MockProbe[],
   alerts: structuredClone(mockAlertRules) as AlertRules,
   notifiers: structuredClone(mockNotifiers) as NotifierConfig[],
   status: structuredClone(mockStatus) as StatusResp,
   bands: structuredClone(DEFAULT_BANDS) as LatencyBand[],
+  schemes: mockLatencySchemes.map((s) => structuredClone(s)) as LatencyScheme[],
 };
 
 const mockDelay = <T>(v: T): Promise<T> => new Promise((resolve) => setTimeout(() => resolve(v), 120));
@@ -265,6 +300,7 @@ function recountStatus() {
       expire_date: s.expire_date,
       renew_price: s.renew_price,
       renew_cycle: s.renew_cycle,
+      currency: s.currency,
     }));
 }
 
@@ -280,12 +316,17 @@ function probeFields(p: MockProbe): Probe {
     interval_s: p.interval_s,
     enabled: p.enabled,
     latency_bands: p.latency_bands ? p.latency_bands.map((b) => ({ ...b })) : null,
+    latency_scheme_id: p.latency_scheme_id,
   };
 }
 
-/** 主控在接口里就把全局默认回退好了，mock 也照做，前端不用再兜一次。 */
+/**
+ * 主控在接口里就把配色回退好了，mock 也照做，前端不用再兜一次。
+ * 优先级与 `BandResolver::resolve` 一致：自定义 → 方案 → 全局默认。
+ */
 function effectiveBands(p: MockProbe): LatencyBand[] {
-  return resolveBands(p.latency_bands, state.bands);
+  const scheme = state.schemes.find((s) => s.id === p.latency_scheme_id);
+  return resolveBands(p.latency_bands, resolveBands(scheme?.bands, state.bands));
 }
 
 /** 只有预置样本有历史曲线，界面上新建的探测显示“暂无数据”。 */
@@ -305,7 +346,14 @@ function probeItem(p: MockProbe, publicOnly = false): ProbeItem {
       online: s.online,
       ...statFor(p.id, s.id),
     }));
-  return { ...probeFields(p), bands: effectiveBands(p), server_ids: [...p.server_ids], targets };
+  return {
+    ...probeFields(p),
+    // 方案 id 只有后台编辑表单要用，公开面有解析好的 bands 就够
+    latency_scheme_id: publicOnly ? null : p.latency_scheme_id,
+    bands: effectiveBands(p),
+    server_ids: [...p.server_ids],
+    targets,
+  };
 }
 
 function probeViewFor(p: MockProbe, serverId: number): ProbeView {
@@ -322,6 +370,7 @@ function applyProbeInput(p: MockProbe, body: ProbeInput) {
   p.enabled = body.enabled;
   p.server_ids = [...body.server_ids];
   p.latency_bands = body.latency_bands ? body.latency_bands.map((b) => ({ ...b })) : null;
+  p.latency_scheme_id = body.latency_scheme_id;
 }
 
 const mockApi: ApiClient = {
@@ -330,9 +379,14 @@ const mockApi: ApiClient = {
     if (!u || p.length < 4) throw new Error("请输入用户名和至少 4 位密码");
     return { token: "mock-token", username: u };
   },
-  me: async () => mockDelay({ username: "admin" }),
+  me: async () => mockDelay({ username: state.username }),
   async changePassword() {
     await sleep(200);
+  },
+  async changeUsername(_password, username) {
+    await sleep(200);
+    state.username = username;
+    return { username };
   },
   status: async () => mockDelay(state.status),
   servers: async () => mockDelay<Server[]>(state.servers),
@@ -344,24 +398,27 @@ const mockApi: ApiClient = {
   },
   async createServer(body) {
     await sleep(200);
+    const b = normalized(body);
     const id = Math.max(0, ...state.servers.map((s) => s.id)) + 1;
     const s: MockServer = {
       id,
-      name: body.name,
-      country: body.country,
-      note: body.note,
-      enabled: body.enabled,
-      expire_date: body.expire_date,
-      renew_price: body.renew_price,
-      renew_cycle: body.renew_cycle,
-      report_interval_s: body.report_interval_s,
+      name: b.name,
+      country: b.country,
+      note: b.note,
+      enabled: b.enabled,
+      expire_date: b.expire_date,
+      never_expire: b.never_expire,
+      renew_price: b.renew_price,
+      renew_cycle: b.renew_cycle,
+      currency: b.currency,
+      report_interval_s: b.report_interval_s,
       created_at: new Date().toISOString(),
       last_seen: 0,
       online: false,
-      days_to_expire: daysTo(body.expire_date),
+      days_to_expire: daysTo(b.expire_date),
       secret_preview: "ab12****ef",
       agent_version: null, // 新建的机器还没连上来，版本要等 Agent 自报
-      traffic: planOf(body, 0, 0),
+      traffic: planOf(b, 0, 0),
       latest: null,
       metrics: [],
     };
@@ -373,10 +430,11 @@ const mockApi: ApiClient = {
     await sleep(200);
     const s = state.servers.find((x) => x.id === id);
     if (!s) throw new Error("服务器不存在");
-    Object.assign(s, body, {
-      days_to_expire: daysTo(body.expire_date),
+    const b = normalized(body);
+    Object.assign(s, b, {
+      days_to_expire: daysTo(b.expire_date),
       // 限额 / 口径 / 重置日变了要按新设置重算，累计的收发字节不动
-      traffic: planOf(body, s.traffic.rx, s.traffic.tx),
+      traffic: planOf(b, s.traffic.rx, s.traffic.tx),
     });
     recountStatus();
   },
@@ -399,6 +457,12 @@ const mockApi: ApiClient = {
     state.servers = state.servers.filter((s) => s.id !== id);
     for (const p of state.probes) p.server_ids = p.server_ids.filter((sid) => sid !== id);
     recountStatus();
+  },
+  async reorderServers(ids) {
+    await sleep(120);
+    // 和主控一样：没出现在 ids 里的机器留在原来的相对位置（追到队尾）
+    const rank = new Map(ids.map((id, i) => [id, i]));
+    state.servers.sort((a, b) => (rank.get(a.id) ?? ids.length) - (rank.get(b.id) ?? ids.length));
   },
   async rotateSecret(id) {
     await sleep(200);
@@ -432,6 +496,7 @@ const mockApi: ApiClient = {
       base_latency_ms: 40,
       loss_rate: 0,
       latency_bands: body.latency_bands ? body.latency_bands.map((b) => ({ ...b })) : null,
+      latency_scheme_id: body.latency_scheme_id,
     };
     state.probes.push(p);
     recountStatus();
@@ -459,6 +524,31 @@ const mockApi: ApiClient = {
   async saveLatencyBands(bands) {
     await sleep(200);
     state.bands = bands.map((b) => ({ ...b }));
+  },
+  latencySchemes: async () => mockDelay(state.schemes.map((s) => structuredClone(s))),
+  async createLatencyScheme(name, bands) {
+    await sleep(200);
+    if (state.schemes.some((s) => s.name === name)) throw new Error("已有同名配色方案");
+    const id = Math.max(0, ...state.schemes.map((s) => s.id)) + 1;
+    const scheme: LatencyScheme = { id, name, bands: bands.map((b) => ({ ...b })) };
+    state.schemes.push(scheme);
+    return structuredClone(scheme);
+  },
+  async updateLatencyScheme(id, name, bands) {
+    await sleep(200);
+    const scheme = state.schemes.find((s) => s.id === id);
+    if (!scheme) throw new Error("配色方案不存在");
+    if (state.schemes.some((s) => s.id !== id && s.name === name)) throw new Error("已有同名配色方案");
+    scheme.name = name;
+    scheme.bands = bands.map((b) => ({ ...b }));
+  },
+  async deleteLatencyScheme(id) {
+    await sleep(200);
+    state.schemes = state.schemes.filter((s) => s.id !== id);
+    // 与后端外键 ON DELETE SET NULL 一致：引用它的目标回退到全局默认
+    for (const p of state.probes) {
+      if (p.latency_scheme_id === id) p.latency_scheme_id = null;
+    }
   },
   metrics: async (id, sinceMs, points) => {
     // 只有预置节点有历史曲线，界面上新建的服务器显示“暂无数据”
@@ -524,6 +614,20 @@ const mockApi: ApiClient = {
   },
 };
 
+/**
+ * 镜像主控 `ServerReq::attrs` 的规范化：永不到期就不留日期、免费就不留价格。
+ *
+ * 表单本来也会同步清掉，这里再做一次是为了让 mock 的返回形状和真主控一致——
+ * 直接调接口（不经表单）时也不会出现「永不到期却带着日期」这种库里不存在的状态。
+ */
+function normalized(body: ServerInput): ServerInput {
+  return {
+    ...body,
+    expire_date: body.never_expire ? null : body.expire_date,
+    renew_price: body.renew_cycle === "free" ? 0 : body.renew_price,
+  };
+}
+
 /** 表单里的三个流量字段 → 展示用的流量视图。 */
 function planOf(body: ServerInput, rx: number, tx: number): Traffic {
   return makeTraffic(
@@ -547,4 +651,4 @@ function daysTo(date: string | null): number | null {
   return Math.round((target - today.getTime()) / 86_400_000);
 }
 
-export const api: ApiClient = isMock() ? mockApi : realApi;
+export const api: ApiClient = MOCK ? mockApi : realApi;

@@ -1,10 +1,12 @@
 //! Mock 数据：本地预览前端样式用（`?mock` 或 VITE_MOCK=1 时启用）。
 //! 合成样本是稳定的，覆盖在线/离线/临期/高负载/丢包等状态。
 
+import { DEFAULT_CURRENCY } from "./money";
 import { makeTraffic, usedBy } from "./traffic";
 import type {
   AlertRules,
   LatencyBand,
+  LatencyScheme,
   MetricPoint,
   Probe,
   ProbePoint,
@@ -82,6 +84,10 @@ interface ServerCfg {
   daysLeft: number | null;
   price: number;
   cycle: RenewCycle;
+  /** 永不到期，置真时 daysLeft 作废 */
+  never?: boolean;
+  /** 续费价格的币种，默认人民币 */
+  currency?: string;
   cpu: number;
   mem: number;
   /** 流量套餐与本周期累计，覆盖限额 / 不限额 / 到量几种展示 */
@@ -118,15 +124,20 @@ function makeServer(id: number, name: string, country: string, online: boolean, 
     country,
     note: online ? "" : "走维护通道中",
     enabled: true,
+    // 永不到期的机器库里就没有日期，mock 照着来，前端拿到的形状和真主控一致
     expire_date:
-      cfg.daysLeft != null ? new Date(now + cfg.daysLeft * 86_400_000).toISOString().slice(0, 10) : null,
+      cfg.never || cfg.daysLeft == null
+        ? null
+        : new Date(now + cfg.daysLeft * 86_400_000).toISOString().slice(0, 10),
+    never_expire: !!cfg.never,
     renew_price: cfg.price,
     renew_cycle: cfg.cycle,
+    currency: cfg.currency ?? DEFAULT_CURRENCY,
     report_interval_s: 5,
     created_at: new Date(now - 120 * HOUR).toISOString(),
     last_seen: online ? now - 15_000 : now - 22 * 60_000,
     online,
-    days_to_expire: cfg.daysLeft,
+    days_to_expire: cfg.never ? null : cfg.daysLeft,
     secret_preview: "ab12****ef",
     agent_version: mockAgentVersion(id),
     traffic: makeTraffic(
@@ -157,11 +168,12 @@ export const mockServers: MockServer[] = [
     mem: 0.71,
     traffic: { limit: 1 * TB, mode: "max", resetDay: 5, rx: 0.94 * TB, tx: 0.36 * TB },
   }),
-  // 不限流量：界面上不应该出现进度条
+  // 不限流量：界面上不应该出现进度条；同时是永久 + 免费的机器（甲骨文那种）
   makeServer(3, "新加坡", "sg", true, {
-    daysLeft: 120,
-    price: 159,
-    cycle: "year",
+    daysLeft: null,
+    never: true,
+    price: 0,
+    cycle: "free",
     cpu: 18,
     mem: 0.28,
     traffic: { limit: 0, mode: "sum", resetDay: 1, rx: 3.4 * TB, tx: 1.1 * TB },
@@ -169,16 +181,18 @@ export const mockServers: MockServer[] = [
   // 已超额，且按「仅上传」计费
   makeServer(4, "美西洛杉矶", "us", false, {
     daysLeft: -2,
-    price: 88,
+    price: 12,
     cycle: "month",
+    currency: "USD",
     cpu: 12,
     mem: 0.2,
     traffic: { limit: 500 * GB, mode: "up", resetDay: 10, rx: 120 * GB, tx: 521 * GB },
   }),
   makeServer(5, "德国法兰克福", "de", true, {
     daysLeft: 210,
-    price: 199,
+    price: 49,
     cycle: "year",
+    currency: "EUR",
     cpu: 51,
     mem: 0.55,
     traffic: { limit: 20 * TB, mode: "sum", resetDay: 15, rx: 2.1 * TB, tx: 1.02 * TB },
@@ -271,6 +285,7 @@ function makeProbe(
   lossRate: number,
   enabled = true,
   bands: LatencyBand[] | null = null,
+  schemeId: number | null = null,
 ): MockProbe {
   return {
     id,
@@ -285,22 +300,41 @@ function makeProbe(
     base_latency_ms: baseLatency,
     loss_rate: lossRate,
     latency_bands: bands,
+    latency_scheme_id: schemeId,
   };
 }
+
+/**
+ * 命名配色方案：把「优化线路 / 跨洋直连」这类分组落到阈值上，
+ * 同类线路引用同一套，改方案就等于改所有引用它的目标。
+ */
+export const mockLatencySchemes: LatencyScheme[] = [
+  {
+    id: 1,
+    name: "优化线路",
+    bands: [{ max_ms: 60, color: "#22c55e" }, { max_ms: 120, color: "#f59e0b" }, { color: "#ef4444" }],
+  },
+  {
+    id: 2,
+    name: "跨洋直连",
+    bands: [
+      { max_ms: 140, color: "#22c55e" },
+      { max_ms: 260, color: "#3b82f6" },
+      { max_ms: 400, color: "#f59e0b" },
+      { color: "#ef4444" },
+    ],
+  },
+];
 
 /** 探测目标跨客户端复用：同一个目标可以对比不同机房的延迟。 */
 export const mockProbes: MockProbe[] = [
   makeProbe(1, "主站 HTTPS", "www.example.com", "tcp", 443, [1, 2, 3, 5], 38, 0.004),
   makeProbe(2, "主站 ICMP", "www.example.com", "icmp", null, [1, 2, 3, 5, 6], 32, 0.05),
   makeProbe(3, "数据库", "10.0.0.5", "tcp", 3306, [1, 5], 11, 0),
-  // 跨洋链路本来就慢，单独放宽阈值：演示「按目标自定义配色」
-  makeProbe(4, "备用节点", "2001:db8::1", "tcp", 22, [3, 4], 96, 0.02, true, [
-    { max_ms: 140, color: "#22c55e" },
-    { max_ms: 260, color: "#3b82f6" },
-    { max_ms: 400, color: "#f59e0b" },
-    { color: "#ef4444" },
-  ]),
-  makeProbe(5, "CDN 边缘", "cdn.example.com", "icmp", null, [2, 3], 19, 0.001),
+  // 跨洋链路本来就慢，引用放宽了阈值的方案
+  makeProbe(4, "备用节点", "2001:db8::1", "tcp", 22, [3, 4], 96, 0.02, true, null, 2),
+  // 优化线路，阈值比全局默认更严
+  makeProbe(5, "CDN 边缘", "cdn.example.com", "icmp", null, [2, 3], 19, 0.001, true, null, 1),
   makeProbe(6, "旧监控入口", "old.example.com", "tcp", 80, [], 0, 0, false),
 ];
 
@@ -381,6 +415,7 @@ export const mockStatus: StatusResp = {
       expire_date: s.expire_date,
       renew_price: s.renew_price,
       renew_cycle: s.renew_cycle,
+      currency: s.currency,
     })),
 };
 
