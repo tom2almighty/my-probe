@@ -1,31 +1,21 @@
 # MyProbe
 
-服务器监控与延迟探测系统。主控是一个自带前端的单文件程序，被监控的机器上运行 Agent，Agent 主动连回主控上报数据。
+服务器监控与延迟探测系统。主控是一个自带前端的单文件程序，被监控的机器上运行 Agent，由 Agent 主动连回主控上报，被监控机器无需开放入站端口。
 
 ## 功能
 
 - 整机指标：CPU、内存、磁盘、网卡速率、平均负载、运行时长
-- 延迟探测：对目标地址做 TCP 或 ICMP 探测，可设间隔与超时，看历史曲线、丢包与可用率
-- 一个探测目标可以指派给多台机器，横向对比各节点到同一目标的延迟
-- 公开状态页：`/` 无需登录查看所有节点，点进某台看单机详情与历史曲线
+- 流量统计：按周期累计上下行用量，可设限额、重置日与计费方式（仅上传 / 仅下载 / 上传 + 下载 / 上下行取大），支持手动校正
+- 延迟探测：对目标地址做 TCP 或 ICMP 探测，可设间隔与超时，看历史曲线、丢包与可用率；一个目标可指派给多台机器，横向对比各节点
 - 资产信息：到期日期、续费价格、续费周期，到期前提醒
-- 告警：离线、CPU / 内存 / 磁盘超阈值、探测延迟超阈值、即将到期，通过 Telegram 发送
+- 告警：离线、CPU / 内存 / 磁盘 / 流量超阈值、探测延迟超阈值、即将到期，通过 Telegram 发送
+- 公开状态页：`/` 无需登录查看所有节点，不含接入密钥、到期日期、续费价格与备注
 - 界面支持亮色 / 暗色 / 跟随系统
 - 单文件部署：前端与 SQLite 都在二进制内，主控与 Agent 也都提供 Docker 镜像
 
-## 架构
-
-```
-浏览器 ──HTTP/WS──> 主控 myprobe-server ──WS──< Agent myprobe-agent
-                        │
-                        └── SQLite（data/myprobe.db）
-```
-
-Agent 只向外发起连接，被监控的机器不需要开放入站端口。
-
 ## 部署
 
-### 一键脚本（Linux）
+### 一键脚本（Linux x86_64 / arm64）
 
 主控 / 客户端、二进制 / Docker 四种组合都由同一个脚本管理。先装主控：
 
@@ -37,43 +27,33 @@ sudo bash myprobe.sh                 # 交互菜单
 sudo bash myprobe.sh install-server --mode docker --port 8000 --password '换成你的密码' --yes
 ```
 
-主控自己会在 `/install.sh` 提供同一份脚本，所以被监控机器不用再去 GitHub，装出来的版本也天然和面板对齐。在后台添加服务器拿到密钥后，弹窗里的「一键脚本」直接复制：
+主控自己会在 `/install.sh` 提供同一份脚本，被监控机器不用再去 GitHub，装出来的版本也天然和面板对齐。在后台添加服务器拿到密钥后，弹窗里的「一键脚本」直接复制：
 
 ```bash
 curl -fsSL http://<主控 IP>:8000/install.sh | sudo bash -s -- install-agent \
   --server ws://<主控 IP>:8000/ws/agent --secret <接入密钥> --yes
 ```
 
-不想让密钥进 shell 历史就走环境变量（`MYPROBE_AGENT_SECRET`、`MYPROBE_AGENT_SERVER`、`MYPROBE_ADMIN_PASSWORD` 都与同名参数等价）：
+不想让密钥进 shell 历史就走环境变量，`MYPROBE_AGENT_SECRET`、`MYPROBE_AGENT_SERVER`、`MYPROBE_ADMIN_PASSWORD` 都与同名参数等价：
 
 ```bash
 curl -fsSL http://<主控 IP>:8000/install.sh | sudo MYPROBE_AGENT_SECRET=<接入密钥> bash -s -- \
   install-agent --server ws://<主控 IP>:8000/ws/agent --yes
 ```
 
-安装时脚本会把自己放到 `/usr/local/bin/myprobe`，之后直接敲 `myprobe`：`status`、`logs <组件>`、`restart <组件>`、`update <组件>`、`auto-update <on|off> <组件>`、`uninstall <组件>`，`-h` 看完整用法。
+脚本会装好 systemd 服务（或 Docker 容器）、写好 `/etc/myprobe/*.env` 与数据目录 `/var/lib/myprobe`，下载的二进制校验 SHA256，服务以非 root 用户运行。安装时脚本会把自己放到 `/usr/local/bin/myprobe`，之后直接敲 `myprobe`：`status`、`logs <组件>`、`restart <组件>`、`update <组件>`、`auto-update <on|off> <组件>`、`uninstall <组件>`，`-h` 看完整用法。
 
-脚本会装好 systemd 服务（或 docker 容器）、写好 `/etc/myprobe/*.env` 与数据目录 `/var/lib/myprobe`，二进制默认取静态链接的 musl 版本并校验 SHA256，服务以非 root 用户运行。
-
-**自动更新**：客户端默认开启（`--no-auto-update` 关掉），主控默认关闭（`--auto-update` 打开，升级可能带数据库迁移，建议自己挑时间）。实现是一个 systemd timer，每天跑一次 `myprobe update <组件>`：
-
-- 先解析 `releases/latest` 的真实 tag，和上次装的一样就什么都不做（Docker 模式比对镜像 ID），不会无谓重启；
-- 更新前留一份旧二进制，重启后服务没起来就自动回滚并退出非零，`systemctl status myprobe-agent-update.timer` 能看到失败；
-- 客户端重启那几秒不会误报离线：在线判定以「多久没有心跳」为准（`MYPROBE_OFFLINE_AFTER`，默认 30 秒）。
-
-后台服务器列表里每台机器会显示 Agent 自报的版本，落后的标黄，一眼看出哪台没跟上。
-
-`myprobe auto-update off agent` 随时可以关掉；`--force` 可以在版本没变化时强制重装。
+自动更新是一个每天跑一次的 systemd timer：客户端默认开启（`--no-auto-update` 关掉），主控默认关闭（`--auto-update` 打开，升级可能带数据库迁移）。版本没变就不动，更新后服务起不来会自动回滚到上一个版本。
 
 ### 预编译二进制
 
-[Releases](https://github.com/tom2almighty/my-probe/releases) 里每个平台一个压缩包，`myprobe-server-*` 是主控，`myprobe-agent-*` 是客户端，`*-musl` 为静态链接版本（不挑 glibc 版本，老系统优先选它），校验和见 `SHA256SUMS`。
+[Releases](https://github.com/tom2almighty/my-probe/releases) 按平台各一个压缩包：`linux-amd64`、`linux-arm64`、`macos-amd64`、`macos-arm64`、`windows-amd64`，`myprobe-server-*` 是主控，`myprobe-agent-*` 是客户端。Linux 版为静态链接，不依赖系统 glibc；校验和见 `SHA256SUMS`。
 
 ```bash
-tar -xzf myprobe-server-x86_64-unknown-linux-musl.tar.gz
+tar -xzf myprobe-server-linux-amd64.tar.gz
 MYPROBE_ADMIN_PASSWORD='换成你的密码' ./myprobe-server
 
-tar -xzf myprobe-agent-x86_64-unknown-linux-musl.tar.gz
+tar -xzf myprobe-agent-linux-amd64.tar.gz
 ./myprobe-agent --server ws://<主控 IP>:8000/ws/agent --secret <接入密钥>
 ```
 
@@ -102,29 +82,17 @@ docker run -d --name myprobe-agent --restart unless-stopped \
   ghcr.io/tom2almighty/myprobe-agent:latest
 ```
 
-Agent 容器要 `--network host` 才能读到宿主机网卡速率，磁盘用量来自只读挂载进来的宿主根目录（容器自身的 overlay 层不计入），`--cap-add NET_RAW` 仅 ICMP 探测需要。
+Agent 容器要 `--network host` 才能读到宿主机网卡速率，磁盘用量来自只读挂载进来的宿主根目录，`--cap-add NET_RAW` 仅 ICMP 探测需要。也可以用仓库里的 `docker-compose.yml`，把密码和密钥写进同目录的 `.env` 后 `docker compose up -d`。自己构建镜像用 `Dockerfile`（主控）与 `Dockerfile.agent`（Agent）。
 
-也可以用仓库里的 `docker-compose.yml`（把密码和密钥写进同目录的 `.env`）：
-
-```bash
-echo "MYPROBE_ADMIN_PASSWORD=换成你的密码" >> .env
-echo "MYPROBE_AGENT_SECRET=<接入密钥>" >> .env
-docker compose up -d
-```
-
-自己构建镜像用仓库里的 `Dockerfile`（主控）与 `Dockerfile.agent`（Agent）。
-
-### 首次使用
+## 使用
 
 浏览器打开 `http://<主控 IP>:8000`，默认落在公开状态页，右上角进后台，用户名 `admin`。未设置 `MYPROBE_ADMIN_PASSWORD` 时会自动生成初始密码并打印到日志（`myprobe logs server` / `docker logs myprobe-server`），登录后在左下角用户菜单里改掉。
-
-然后按需要配置：
 
 1. 「服务器 → 新建」创建一台机器，弹窗给出该机器的接入密钥（只显示一次）和现成的安装命令，到那台机器上执行即可
 2. 「延迟探测 → 新建」填目标地址与协议（TCP / ICMP），勾选由哪些机器去探测
 3. 「告警与通知」配置阈值与 Telegram 渠道
 
-公开状态页只展示启用状态的服务器与探测目标，不含接入密钥、到期日期、续费价格和备注；把某台机器停用即从公开页移除。
+公开状态页只展示启用状态的服务器与探测目标，把某台机器停用即从公开页移除。
 
 ## 配置
 
@@ -141,22 +109,20 @@ docker compose up -d
 
 ### Agent（环境变量或命令行参数）
 
-| 变量                       | 参数       | 默认值                         | 说明                                        |
-| -------------------------- | ---------- | ------------------------------ | ------------------------------------------- |
-| `MYPROBE_AGENT_SERVER`     | `--server` | `ws://127.0.0.1:8000/ws/agent` | 主控地址，HTTPS 部署时用 `wss://`           |
-| `MYPROBE_AGENT_SECRET`     | `--secret` | 必填                           | 后台创建服务器时发放的接入密钥              |
-| `MYPROBE_AGENT_NAME`       | `--name`   | 空                             | 展示名，留空则用后台配置的名称              |
-| `MYPROBE_AGENT_NET_IFACES` | —          | 空                             | 只统计这些网卡（逗号分隔），见下            |
+| 变量                       | 参数       | 默认值                         | 说明                              |
+| -------------------------- | ---------- | ------------------------------ | --------------------------------- |
+| `MYPROBE_AGENT_SERVER`     | `--server` | `ws://127.0.0.1:8000/ws/agent` | 主控地址，HTTPS 部署时用 `wss://` |
+| `MYPROBE_AGENT_SECRET`     | `--secret` | 必填                           | 后台创建服务器时发放的接入密钥    |
+| `MYPROBE_AGENT_NAME`       | `--name`   | 空                             | 展示名，留空则用后台配置的名称    |
+| `MYPROBE_AGENT_NET_IFACES` | —          | 空                             | 只统计这些网卡（逗号分隔）        |
 
-网卡默认自动排除回环与容器 / 网桥 / 隧道口（`lo`、`docker*`、`veth*`、`br-*`、`virbr*`、`cni*`、`cali*`、`flannel*` 等）——这些口上的流量是真实网卡流量的副本，一起相加会让 Docker 宿主机的速率翻倍。多网卡机器想只统计计费的那张口，就显式列出来，例如 `MYPROBE_AGENT_NET_IFACES=eth0`（一键脚本生成的 `/etc/myprobe/agent.env` 里留了注释行）。
+网卡默认自动排除回环与容器 / 网桥 / 隧道口（`lo`、`docker*`、`veth*`、`br-*` 等），这些口上的流量是真实网卡流量的副本，相加会让宿主机速率翻倍。多网卡机器想只统计计费的那张口就显式列出，例如 `MYPROBE_AGENT_NET_IFACES=eth0`。
 
-上报间隔、探测目标与协议都由主控下发，改动后 Agent 立即生效，无需重启。
-
-对外提供服务建议自己在前面套一层 HTTPS 反向代理（Nginx / Caddy 都行），放行 `/ws/agent`、`/ws/ui`、`/ws/public` 的 WebSocket 升级即可，Agent 侧改成 `wss://你的域名/ws/agent`。
+上报间隔、探测目标与协议都由主控下发，改动后 Agent 立即生效，无需重启。对外提供服务建议自己在前面套一层 HTTPS 反向代理（Nginx / Caddy 都行），放行 `/ws/agent`、`/ws/ui`、`/ws/public` 的 WebSocket 升级即可，Agent 侧改成 `wss://你的域名/ws/agent`。
 
 ### Telegram 通知
 
-后台「告警」页配置，Telegram 渠道需要两个参数：
+后台「告警与通知」页配置，需要两个参数：
 
 - `bot_token`：向 [@BotFather](https://t.me/BotFather) 发送 `/newbot` 获取
 - `chat_id`：先给你的 bot 发一条消息，再访问 `https://api.telegram.org/bot<token>/getUpdates`，从返回里取 `chat.id`
@@ -165,33 +131,23 @@ docker compose up -d
 
 ## 开发
 
-需要 Rust stable 与 [bun](https://bun.sh)。
+需要 Rust stable 与 [bun](https://bun.sh)。前端产物在编译期嵌入主控二进制，所以改完前端要先 `bun run build` 再 `cargo build`，否则二进制里还是旧页面。
 
 ```bash
 git clone https://github.com/tom2almighty/my-probe.git
 cd my-probe/web && bun install && cd ..
-```
 
-开两个终端分别跑主控和前端：
-
-```bash
 cargo run -p myprobe-server      # 主控，http://127.0.0.1:8000
 cd web && bun run dev            # 前端，http://localhost:5173（API 与 WS 已代理到 8000）
 ```
 
-开发时访问 5173：改前端自动热更新，改后端重启 `cargo run`。首次启动的管理员密码会打印在主控日志里，也可以自己指定：`MYPROBE_ADMIN_PASSWORD=test1234 cargo run -p myprobe-server`。
-
-只调前端样式时不用开后端：访问 `http://localhost:5173/?mock`，数据和实时事件都是内置的模拟数据，登录页随便填密码即可进入。
-
-想接一个真的 Agent，先在后台建一台机器拿到密钥：
+开发时访问 5173，改前端自动热更新。只调样式不用开后端：访问 `http://localhost:5173/?mock` 走内置模拟数据，登录页随便填密码即可进入。想接一个真的 Agent，先在后台建一台机器拿到密钥：
 
 ```bash
 cargo run -p myprobe-agent -- --server ws://127.0.0.1:8000/ws/agent --secret <密钥>
 ```
 
-### 提交前检查
-
-和 CI 跑的一样：
+提交前检查（和 CI 一致）：
 
 ```bash
 cd web && bun run lint && bun run check && cd ..
@@ -200,28 +156,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-格式化：前端 `cd web && bun run fmt`（biome），后端 `cargo fmt --all`。
-
-### 代码结构
-
-| 目录            | 内容                                                                                   |
-| --------------- | -------------------------------------------------------------------------------------- |
-| `crates/shared` | 主控与 Agent 之间的消息定义，改协议从这里开始                                          |
-| `crates/server` | 主控：REST API、WebSocket 接入、SQLite、告警、静态资源嵌入                             |
-| `crates/agent`  | Agent：指标采集、TCP / ICMP 探测、断线重连                                             |
-| `web`           | 前端：React + Vite + Tailwind + shadcn/ui，页面在 `src/pages`，组件在 `src/components` |
-| `scripts`       | 一键部署脚本                                                                           |
-
-### 构建
-
-前端产物会在编译期嵌入主控二进制，所以顺序不能反：
-
-```bash
-cd web && bun run build && cd ..
-cargo build --release
-# 产物：target/release/myprobe-server、target/release/myprobe-agent
-```
-
-改完前端要重新 `bun run build` 再 `cargo build`，否则二进制里还是旧页面。Agent 不含前端，单独构建用 `cargo build --release -p myprobe-agent`。
-
-发版推一个 `v*` tag，GitHub Actions 会构建各平台二进制与多架构镜像并汇总成 Release。
+发版推一个 `v*` tag，GitHub Actions 构建各平台二进制与多架构镜像并汇总成 Release。

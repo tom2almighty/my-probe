@@ -112,16 +112,12 @@ fetch() { # url 目标文件
     die "需要 curl 或 wget"
   fi
 }
-detect_target() { # server|agent -> rust target 三元组
+detect_platform() { # -> Release 里的平台名
   [ "$(uname -s)" = Linux ] || die "一键脚本仅支持 Linux，其他系统请从 Release 手动下载"
   case "$(uname -m)" in
-    x86_64 | amd64) echo x86_64-unknown-linux-musl ;;
-    aarch64 | arm64) echo aarch64-unknown-linux-musl ;;
-    armv7l | armv6l)
-      [ "$1" = agent ] || die "32 位 ARM 只提供客户端二进制，主控请用 --mode docker"
-      echo armv7-unknown-linux-musleabihf
-      ;;
-    *) die "不支持的架构 $(uname -m)，请自行编译" ;;
+    x86_64 | amd64) echo linux-amd64 ;;
+    aarch64 | arm64) echo linux-arm64 ;;
+    *) die "不支持的架构 $(uname -m)，官方只发布 x86_64 / arm64 版本，其他架构请自行编译" ;;
   esac
 }
 
@@ -211,9 +207,9 @@ release_base() { # [tag]
 }
 
 install_binary() { # server|agent；成功后 RESOLVED_VERSION 为实际安装的 tag
-  local comp="$1" target asset base tmp tag
-  target=$(detect_target "$comp")
-  asset="myprobe-$comp-$target.tar.gz"
+  local comp="$1" plat asset base tmp tag
+  plat=$(detect_platform)
+  asset="myprobe-$comp-$plat.tar.gz"
   tag=$(resolve_version)
   base=$(release_base "$tag")
   tmp=$(mktemp -d)

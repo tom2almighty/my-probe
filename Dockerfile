@@ -19,6 +19,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# static_assets.rs 用 include_str! 把一键脚本编进二进制，缺了它编译期就报错
+COPY scripts/ scripts/
 COPY --from=web /web/dist web/dist
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

@@ -68,6 +68,6 @@ jobs:
             docker pull ghcr.io/${{ env.OWNER }}/myprobe-agent:${{ github.ref_name }}
             ```
 
-            下面的附件里，`myprobe-server-*` 是主控，`myprobe-agent-*` 是客户端，
-            `*-musl` 为静态链接版本（不挑 glibc 版本，老系统优先选它）。
-            校验和见 `SHA256SUMS`。
+            附件里 `myprobe-server-*` 是主控，`myprobe-agent-*` 是客户端，
+            按平台选 `linux-amd64` / `linux-arm64` / `macos-amd64` / `macos-arm64` / `windows-amd64`。
+            Linux 版为静态链接，不依赖系统 glibc。校验和见 `SHA256SUMS`。

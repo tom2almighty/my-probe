@@ -40,20 +40,19 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.name }}
     needs: web
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Linux 一律 musl 静态链接：单文件、不依赖系统 glibc
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, archive: tar.gz }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, archive: tar.gz, musl: true }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.gz }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, archive: tar.gz, musl: true }
-          - { target: x86_64-apple-darwin, os: macos-latest, archive: tar.gz }
-          - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
+          - { name: linux-amd64, target: x86_64-unknown-linux-musl, os: ubuntu-24.04, archive: tar.gz }
+          - { name: linux-arm64, target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, archive: tar.gz }
+          - { name: macos-amd64, target: x86_64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { name: macos-arm64, target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
+          - { name: windows-amd64, target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
     steps:
       - uses: actions/checkout@v7
 
@@ -72,7 +71,7 @@ jobs:
           key: server-${{ matrix.target }}
 
       - name: 安装 musl 工具链
-        if: matrix.musl
+        if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: 构建
@@ -89,18 +88,18 @@ jobs:
         shell: bash
         run: |
           tar -C "target/${{ matrix.target }}/release" -czf \
-            "$GITHUB_WORKSPACE/myprobe-server-${{ matrix.target }}.tar.gz" myprobe-server
+            "$GITHUB_WORKSPACE/myprobe-server-${{ matrix.name }}.tar.gz" myprobe-server
 
       - name: 打包 zip
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/myprobe-server.exe" `
-            -DestinationPath "myprobe-server-${{ matrix.target }}.zip"
+            -DestinationPath "myprobe-server-${{ matrix.name }}.zip"
 
       # 产物名不带版本号，这样 releases/latest/download/<名字> 永远可用
       - uses: actions/upload-artifact@v7
         with:
-          name: myprobe-server-${{ matrix.target }}
-          path: myprobe-server-${{ matrix.target }}.${{ matrix.archive }}
+          name: myprobe-server-${{ matrix.name }}
+          path: myprobe-server-${{ matrix.name }}.${{ matrix.archive }}
           if-no-files-found: error

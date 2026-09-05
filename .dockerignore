@@ -12,7 +12,6 @@ data/
 .git
 .github
 .gitignore
-scripts
 Dockerfile
 Dockerfile.agent
 docker-compose.yml
