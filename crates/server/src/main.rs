@@ -96,6 +96,8 @@ async fn main() {
         .route("/ws/agent", get(ws::ws_agent))
         .route("/ws/ui", get(ws::ui::ws_ui))
         .route("/ws/public", get(ws::ui::ws_public))
+        // 一键部署脚本：被监控机器 curl 这个地址即可，无需先访问 GitHub
+        .route("/install.sh", get(static_assets::install_script))
         .layer(opt_cors)
         .layer(TraceLayer::new_for_http())
         .fallback(static_assets::serve_static)

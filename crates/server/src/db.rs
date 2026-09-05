@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS servers (
     renew_cycle  TEXT NOT NULL DEFAULT 'month',
     report_interval_s INTEGER NOT NULL DEFAULT 5,
     created_at   TEXT NOT NULL,
-    last_seen    INTEGER NOT NULL DEFAULT 0
+    last_seen    INTEGER NOT NULL DEFAULT 0,
+    agent_version TEXT
 );
 
 -- 探测目标独立于服务器：一个探测可以派给任意多个客户端执行。
@@ -97,6 +98,7 @@ impl Db {
         conn.pragma_update(None, "busy_timeout", "5000")?;
         conn.execute_batch(SCHEMA)?;
         migrate_probes(&conn)?;
+        migrate_servers(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -166,7 +168,7 @@ impl Db {
         let mut stmt = c
             .prepare(
                 "SELECT id, name, secret, country, note, enabled, expire_date,
-                        renew_price, renew_cycle, report_interval_s, created_at, last_seen
+                        renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
                  FROM servers ORDER BY id",
             )
             .unwrap();
@@ -180,7 +182,7 @@ impl Db {
         let c = self.conn.lock().unwrap();
         c.query_row(
             "SELECT id, name, secret, country, note, enabled, expire_date,
-                    renew_price, renew_cycle, report_interval_s, created_at, last_seen
+                    renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
              FROM servers WHERE id = ?1",
             params![id],
             row_to_server,
@@ -194,7 +196,7 @@ impl Db {
         let c = self.conn.lock().unwrap();
         c.query_row(
             "SELECT id, name, secret, country, note, enabled, expire_date,
-                    renew_price, renew_cycle, report_interval_s, created_at, last_seen
+                    renew_price, renew_cycle, report_interval_s, created_at, last_seen, agent_version
              FROM servers WHERE secret = ?1",
             params![secret],
             row_to_server,
@@ -278,6 +280,15 @@ impl Db {
     pub fn touch_last_seen(&self, id: i64, ts: i64) {
         let c = self.conn.lock().unwrap();
         let _ = c.execute("UPDATE servers SET last_seen=?1 WHERE id=?2", params![ts, id]);
+    }
+
+    /// 记录 Agent 上报的版本号，用于后台看出哪台还没更新。
+    pub fn set_agent_version(&self, id: i64, version: &str) {
+        let c = self.conn.lock().unwrap();
+        let _ = c.execute(
+            "UPDATE servers SET agent_version=?1 WHERE id=?2",
+            params![version, id],
+        );
     }
 
     pub fn rotate_secret(&self, id: i64, secret: &str) -> rusqlite::Result<()> {
@@ -714,6 +725,7 @@ fn row_to_server(r: &rusqlite::Row) -> rusqlite::Result<Server> {
         report_interval_s: r.get::<_, i64>(9)? as u64,
         created_at,
         last_seen,
+        agent_version: r.get(12)?,
         online: false,
     })
 }
@@ -731,17 +743,29 @@ fn row_to_probe(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
     })
 }
 
+/// 表是否已有某一列。加列式迁移都走它，避免重复 ALTER 报错。
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(cols.iter().any(|c| c == column))
+}
+
+/// servers 表的加列式迁移。
+fn migrate_servers(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "servers", "agent_version")? {
+        tracing::info!("迁移数据库：servers 增加 agent_version 列");
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN agent_version TEXT")?;
+    }
+    Ok(())
+}
+
 /// 旧版本的探测目标直接挂在服务器下（probes.server_id）。这里把它拆成
 /// 独立的 probes + probe_assignments，老数据按原归属生成一条指派记录。
 fn migrate_probes(conn: &Connection) -> rusqlite::Result<()> {
-    let legacy = {
-        let mut stmt = conn.prepare("PRAGMA table_info(probes)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .collect();
-        cols.iter().any(|c| c == "server_id")
-    };
+    let legacy = has_column(conn, "probes", "server_id")?;
     if !legacy {
         return Ok(());
     }

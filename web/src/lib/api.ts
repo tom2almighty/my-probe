@@ -332,6 +332,7 @@ const mockApi: ApiClient = {
       online: false,
       days_to_expire: daysTo(body.expire_date ?? null),
       secret_preview: "ab12****ef",
+      agent_version: null, // 新建的机器还没连上来，版本要等 Agent 自报
       latest: null,
       metrics: [],
     };

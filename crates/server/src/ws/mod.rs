@@ -121,6 +121,11 @@ async fn agent_conn(st: AppState, socket: WebSocket) {
     let server_id = server.id;
     st.db
         .touch_last_seen(server_id, chrono::Utc::now().timestamp_millis());
+    // Agent 版本变了才写库：重连很频繁，没必要每次都 UPDATE
+    if !info.agent_version.is_empty() && server.agent_version.as_deref() != Some(info.agent_version.as_str())
+    {
+        st.db.set_agent_version(server_id, &info.agent_version);
+    }
 
     // ---------- 2. 下发 Welcome + 完整配置 ----------
     let interval = server.report_interval_s.max(1);
@@ -178,20 +183,9 @@ async fn agent_conn(st: AppState, socket: WebSocket) {
 
     agents.unregister(server_id, conn_id);
 
-    // 若没有新连接顶上，则广播离线并触发告警（AlertState 会去重）。
-    let online = st
-        .agents
-        .is_online(server_id, std::time::Duration::from_secs(st.offline_after_s));
-    if !online {
-        if let Some(srv) = st.db.get_server(server_id) {
-            st.push(UiEvent::ServerStatus {
-                id: server_id,
-                online: false,
-                ts: chrono::Utc::now().timestamp_millis(),
-            });
-            alert::notify_offline(&st, &srv, true).await;
-        }
-    }
+    // 这里不直接判离线、也不发告警：在线判定统一交给 offline_sweeper，
+    // 以"多久没有心跳"为准（MYPROBE_OFFLINE_AFTER）。Agent 重启（尤其是
+    // 自动更新那几秒）不会再推出一对 🔴 + 🟢。
     tracing::info!("Agent 断开: {} ({server_id})", server.name);
 }
 

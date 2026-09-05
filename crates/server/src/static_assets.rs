@@ -10,6 +10,21 @@ use rust_embed::RustEmbed;
 #[folder = "../../web/dist"]
 struct Assets;
 
+/// 一键部署脚本，编译期嵌进二进制。让被监控机器直接从主控取脚本：
+/// 版本与主控严格一致，且不额外依赖 GitHub 的可达性。
+/// 脚本本身不含任何密钥，接入密钥由命令行参数传入，所以这个端点是公开的。
+const INSTALL_SCRIPT: &str = include_str!("../../../scripts/myprobe.sh");
+
+/// GET /install.sh
+pub async fn install_script() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(INSTALL_SCRIPT))
+        .unwrap()
+}
+
 /// 静态文件服务（含 SPA fallback 到 index.html）。
 pub async fn serve_static(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');

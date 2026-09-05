@@ -63,10 +63,41 @@ fn countable(disk: &sysinfo::Disk) -> bool {
         && !mount.starts_with("/var/lib/kubelet")
 }
 
+/// 虚拟网卡前缀：容器 / 网桥 / 隧道口上的流量都是宿主真实网卡流量的副本，
+/// 一起相加会让 Docker 宿主机的速率与流量翻倍甚至翻几倍。
+const SKIP_IFACE: &[&str] = &[
+    "lo", "docker", "veth", "br-", "virbr", "vnet", "cni", "flannel", "cali", "kube", "cilium", "nerdctl",
+    "podman", "dummy", "tap",
+];
+
+/// 该网卡是否计入速率与流量统计。
+/// `MYPROBE_AGENT_NET_IFACES` 可给一份逗号分隔的白名单（只统计列出的网卡），
+/// 用于多网卡机器上排除不计费的内网口。
+fn iface_counted(name: &str, allow: Option<&[String]>) -> bool {
+    if let Some(list) = allow {
+        return list.iter().any(|w| w == name);
+    }
+    !SKIP_IFACE.iter().any(|p| name.starts_with(p))
+}
+
+fn iface_allowlist() -> Option<Vec<String>> {
+    let raw = std::env::var("MYPROBE_AGENT_NET_IFACES").ok()?;
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.is_empty() { None } else { Some(list) }
+}
+
 pub struct Collector {
     sys: System,
     nets: Networks,
     disks: Disks,
+    /// 上次采样时刻。sysinfo 给的是"自上次刷新以来的字节数"，
+    /// 要除以实际间隔才是速率，否则上报间隔越长速率虚高越多。
+    last_sample: Option<std::time::Instant>,
+    net_allow: Option<Vec<String>>,
 }
 
 impl Collector {
@@ -75,6 +106,8 @@ impl Collector {
             sys: System::new_all(),
             nets: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
+            last_sample: Some(std::time::Instant::now()),
+            net_allow: iface_allowlist(),
         }
     }
 
@@ -83,8 +116,17 @@ impl Collector {
         // 刷新易变部分：CPU 使用率、内存、网卡速率
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        self.nets.refresh(false);
+        // true：拔掉/销毁的网卡要从列表里移除，否则它最后一次的增量会被一直算进速率
+        self.nets.refresh(true);
         self.disks.refresh(false);
+
+        // 上次采样到现在实际过去了多久。首次采样从 Collector 创建时算起。
+        let elapsed = self
+            .last_sample
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(1.0)
+            .max(0.001);
+        self.last_sample = Some(std::time::Instant::now());
 
         let mut disk_samples: Vec<DiskSample> = Vec::new();
         // 同一设备的多个挂载点（bind mount、btrfs 子卷）只算一次
@@ -104,13 +146,18 @@ impl Collector {
         // 挂载点排序，保证顺序稳定
         disk_samples.sort_by(|a, b| a.mount.cmp(&b.mount));
 
-        let mut net_in: u64 = 0;
-        let mut net_out: u64 = 0;
-        for nd in self.nets.list().values() {
-            // received()/transmitted() 为自上次刷新以来的速率（bytes/s）
-            net_in += nd.received();
-            net_out += nd.transmitted();
+        let mut rx: u64 = 0;
+        let mut tx: u64 = 0;
+        for (name, nd) in self.nets.list().iter() {
+            if !iface_counted(name, self.net_allow.as_deref()) {
+                continue;
+            }
+            // received()/transmitted() 是"自上次刷新以来"的字节数，不是速率
+            rx += nd.received();
+            tx += nd.transmitted();
         }
+        let net_in = (rx as f64 / elapsed).round() as u64;
+        let net_out = (tx as f64 / elapsed).round() as u64;
 
         let load = System::load_average();
 

@@ -17,6 +17,8 @@ export interface Server {
   online: boolean;
   days_to_expire: number | null;
   secret_preview: string;
+  /** Agent 上报的自身版本，从未连接过时为 null */
+  agent_version: string | null;
   /** 最新一次上报的整机指标 */
   latest: MetricPoint | null;
 }

@@ -25,6 +25,8 @@ pub struct Server {
     pub created_at: DateTime<Utc>,
     /// 最近一次在线时间（agent 心跳），unix 毫秒，0 表示从未在线。
     pub last_seen: i64,
+    /// Agent 在 Hello 里上报的自身版本，从未连接过则为 None。
+    pub agent_version: Option<String>,
     pub online: bool,
 }
 

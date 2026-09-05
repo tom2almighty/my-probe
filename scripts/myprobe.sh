@@ -5,6 +5,16 @@
 #   sudo bash myprobe.sh install-server --mode docker --port 8000 --yes
 #   sudo bash myprobe.sh install-agent --server ws://1.2.3.4:8000/ws/agent --secret xxx --yes
 #
+# 主控自带这个脚本，被监控机器可以直接从主控取，一条命令装完客户端：
+#   curl -fsSL http://<主控>/install.sh | sudo bash -s -- install-agent \
+#     --server ws://<主控>:8000/ws/agent --secret <密钥> --yes
+# 密钥也可以走环境变量，避免落进 shell 历史：
+#   curl -fsSL http://<主控>/install.sh | sudo MYPROBE_AGENT_SECRET=xxx bash -s -- \
+#     install-agent --server ws://<主控>:8000/ws/agent --yes
+#
+# 安装时脚本会把自己放到 $BIN_DIR/myprobe，之后直接 myprobe <命令> 即可；
+# 客户端默认开启每日自动更新（systemd timer），主控默认不开。
+#
 # 主控与客户端都支持二进制（systemd）和 Docker 两种部署方式。
 # HTTPS / 反向代理不在脚本职责范围内，按需自行配置。
 
@@ -17,20 +27,27 @@ DATA_DIR="${MYPROBE_DATA_HOME:-/var/lib/myprobe}"
 BIN_DIR="${MYPROBE_BIN_DIR:-/usr/local/bin}"
 SVC_USER=myprobe
 IMAGE_UID=10001 # 镜像里的运行用户，Docker 模式下数据目录要归它
+# 管道执行时脚本自己不是文件，自动更新需要一份能落地的副本，从这里取
+SCRIPT_URL="${MYPROBE_SCRIPT_URL:-}"
 
-# 命令行给的值优先，其次读已保存的配置，最后才问/取默认
+# 命令行给的值优先，其次读已保存的配置，最后才问/取默认。
+# 敏感参数也接受环境变量，一行命令里就不必把密钥写进 shell 历史。
 OPT_MODE=""
 OPT_PORT=""
-OPT_PASSWORD=""
-OPT_SERVER=""
-OPT_SECRET=""
-OPT_NAME=""
+OPT_PASSWORD="${MYPROBE_ADMIN_PASSWORD:-}"
+OPT_SERVER="${MYPROBE_AGENT_SERVER:-}"
+OPT_SECRET="${MYPROBE_AGENT_SECRET:-}"
+OPT_NAME="${MYPROBE_AGENT_NAME:-}"
 OPT_VERSION=""
+OPT_AUTO_UPDATE=""
 OPT_PURGE=0
+OPT_FORCE=0
 ASSUME_YES=0
 MODE=""
 PORT=""
 VERSION=""
+RESOLVED_VERSION=""
+AUTO_UPDATE=""
 PASSWORD=""
 SERVER_URL=""
 SECRET=""
@@ -108,23 +125,101 @@ detect_target() { # server|agent -> rust target 三元组
   esac
 }
 
-release_base() {
-  if [ "${VERSION:-latest}" = latest ]; then
+script_source() { # -> 能下到脚本的 URL，尽最大努力猜一个
+  if [ -n "$SCRIPT_URL" ]; then
+    printf '%s' "$SCRIPT_URL"
+    return
+  fi
+  # 优先从主控地址推导：ws://host:8000/ws/agent -> http://host:8000/install.sh
+  local u="${SERVER_URL:-}"
+  u="${u%/ws/agent}"
+  case "$u" in
+    wss://*)
+      printf 'https://%s/install.sh' "${u#wss://}"
+      return
+      ;;
+    ws://*)
+      printf 'http://%s/install.sh' "${u#ws://}"
+      return
+      ;;
+  esac
+  printf 'https://raw.githubusercontent.com/%s/main/scripts/myprobe.sh' "$REPO"
+}
+
+# 把脚本自己装到 PATH 里：一是之后能直接敲 myprobe，二是自动更新的 timer
+# 需要一个稳定的可执行路径。成功返回 0。
+self_install() {
+  local dest="$BIN_DIR/myprobe" tmp url
+  if [ -f "$0" ] && [ -r "$0" ]; then
+    if [ "$(readlink -f "$0")" = "$(readlink -f "$dest" 2>/dev/null)" ]; then
+      return 0
+    fi
+    install -m 0755 "$0" "$BIN_DIR/.myprobe.new" || {
+      warn "没能把脚本写到 $dest（自动更新需要它）"
+      return 1
+    }
+  else
+    # curl ... | bash 时 $0 是 bash / /dev/stdin，读不到脚本本体，只能重新下一份
+    url=$(script_source)
+    tmp=$(mktemp)
+    if ! fetch "$url" "$tmp" || [ ! -s "$tmp" ]; then
+      rm -f "$tmp"
+      warn "没能把脚本保存到 $dest（自动更新需要它），可稍后手动放一份：$url"
+      return 1
+    fi
+    install -m 0755 "$tmp" "$BIN_DIR/.myprobe.new" || {
+      rm -f "$tmp"
+      warn "没能把脚本写到 $dest（自动更新需要它）"
+      return 1
+    }
+    rm -f "$tmp"
+  fi
+  # 正在执行的脚本文件不能原地覆盖，rename 换 inode 才安全
+  mv -f "$BIN_DIR/.myprobe.new" "$dest"
+  ok "脚本已安装到 $dest（之后可直接执行 myprobe）"
+}
+
+# VERSION=latest 时跟一次 releases/latest 的 302，拿到真实 tag。
+# 这样才能判断"有没有新版本"，也能保证二进制和 SHA256SUMS 来自同一个 release。
+# 解析不出来（网络受限 / 没有 curl -I）就回退 latest，行为跟以前一致。
+resolve_version() {
+  local want="${VERSION:-latest}" final=""
+  if [ "$want" != latest ]; then
+    printf '%s' "$want"
+    return
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    final=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --retry 2 \
+      "https://github.com/$REPO/releases/latest" 2>/dev/null) || final=""
+  elif command -v wget >/dev/null 2>&1; then
+    final=$(wget -qS --spider "https://github.com/$REPO/releases/latest" 2>&1 \
+      | awk '/[Ll]ocation:/ {print $2}' | tail -1) || final=""
+  fi
+  case "$final" in
+    */releases/tag/?*) printf '%s' "${final##*/}" ;;
+    *) printf 'latest' ;;
+  esac
+}
+
+release_base() { # [tag]
+  local tag="${1:-${VERSION:-latest}}"
+  if [ "$tag" = latest ]; then
     echo "https://github.com/$REPO/releases/latest/download"
   else
-    echo "https://github.com/$REPO/releases/download/$VERSION"
+    echo "https://github.com/$REPO/releases/download/$tag"
   fi
 }
 
-install_binary() { # server|agent
-  local comp="$1" target asset base tmp
+install_binary() { # server|agent；成功后 RESOLVED_VERSION 为实际安装的 tag
+  local comp="$1" target asset base tmp tag
   target=$(detect_target "$comp")
   asset="myprobe-$comp-$target.tar.gz"
-  base=$(release_base)
+  tag=$(resolve_version)
+  base=$(release_base "$tag")
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
 
-  info "下载 $asset（$VERSION）"
+  info "下载 $asset（$tag）"
   fetch "$base/$asset" "$tmp/$asset" || die "下载失败：$base/$asset"
   if fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
     (cd "$tmp" && grep " $asset\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) \
@@ -135,10 +230,33 @@ install_binary() { # server|agent
   fi
 
   tar -xzf "$tmp/$asset" -C "$tmp"
+  # 留一份旧的：新版本起不来时可以立刻回滚
+  if [ -x "$BIN_DIR/myprobe-$comp" ]; then
+    cp -f "$BIN_DIR/myprobe-$comp" "$BIN_DIR/myprobe-$comp.old"
+  fi
   # 正在运行的可执行文件不能直接覆盖写，先落临时名再 rename
   install -m 0755 "$tmp/myprobe-$comp" "$BIN_DIR/.myprobe-$comp.new"
   mv -f "$BIN_DIR/.myprobe-$comp.new" "$BIN_DIR/myprobe-$comp"
-  ok "已安装 $BIN_DIR/myprobe-$comp"
+  # tag 还是 latest 说明没解析出真实版本号，别记下来，否则以后判断"没变化"会永远跳过
+  if [ "$tag" = latest ]; then RESOLVED_VERSION=""; else RESOLVED_VERSION="$tag"; fi
+  ok "已安装 $BIN_DIR/myprobe-$comp（$tag）"
+}
+
+# 重启后等一下再看服务是否真的活着。Docker / 无 systemd 环境不做判断。
+verify_service() { # comp -> 0 表示在跑
+  [ "$MODE" = docker ] && return 0
+  has_systemd || return 0
+  sleep 3
+  systemctl is-active --quiet "myprobe-$1"
+}
+
+rollback_binary() { # comp -> 0 表示已回滚
+  local comp="$1" old="$BIN_DIR/myprobe-$1.old"
+  [ -x "$old" ] || return 1
+  warn "新版本启动失败，回滚到上一个版本"
+  install -m 0755 "$old" "$BIN_DIR/.myprobe-$comp.new"
+  mv -f "$BIN_DIR/.myprobe-$comp.new" "$BIN_DIR/myprobe-$comp"
+  systemctl restart "myprobe-$comp" || true
 }
 ensure_user() {
   id -u "$SVC_USER" >/dev/null 2>&1 && return 0
@@ -154,7 +272,19 @@ save_conf() { # comp
 MODE=$MODE
 PORT=$PORT
 VERSION=$VERSION
+# 上次实际装上的 tag：VERSION=latest 时用它判断有没有新版本
+RESOLVED_VERSION=$RESOLVED_VERSION
+AUTO_UPDATE=$AUTO_UPDATE
 EOF
+}
+
+# 读配置前先清空，避免上一个组件的值串到下一个
+reset_conf() {
+  MODE=""
+  PORT=""
+  VERSION=""
+  RESOLVED_VERSION=""
+  AUTO_UPDATE=""
 }
 
 load_conf() { # comp；有配置返回 0
@@ -245,6 +375,65 @@ ProtectHome=true
 WantedBy=multi-user.target
 EOF
 }
+write_update_timer() { # comp
+  local comp="$1" svc="myprobe-$1-update"
+  cat >"/etc/systemd/system/$svc.service" <<EOF
+[Unit]
+Description=MyProbe $comp 自动更新
+Documentation=https://github.com/$REPO
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/myprobe update $comp --yes
+EOF
+  cat >"/etc/systemd/system/$svc.timer" <<EOF
+[Unit]
+Description=MyProbe $comp 每日检查更新
+
+[Timer]
+OnCalendar=daily
+# 关机期间错过的时间点，开机后补跑一次
+Persistent=true
+# 随机推迟最多 1 小时，避免所有机器同一秒去打 GitHub
+RandomizedDelaySec=1h
+Unit=$svc.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+apply_auto_update() { # comp on|off
+  local comp="$1" want="$2" svc="myprobe-$1-update" removed=0
+  if [ "$want" = on ]; then
+    if ! has_systemd; then
+      warn "没有 systemd，自动更新用不了；可自行加 cron 定时执行 myprobe update $comp --yes"
+      AUTO_UPDATE=off
+      return 0
+    fi
+    # timer 要调用一个稳定路径上的脚本；已经装过就不用再下一次
+    if [ ! -x "$BIN_DIR/myprobe" ] && ! self_install; then
+      AUTO_UPDATE=off
+      return 0
+    fi
+    write_update_timer "$comp"
+    systemctl daemon-reload
+    systemctl enable --now "$svc.timer" >/dev/null 2>&1 || warn "启用 $svc.timer 失败"
+    AUTO_UPDATE=on
+    ok "已开启每日自动更新（systemctl list-timers 可看下次执行时间）"
+    return 0
+  fi
+  if has_systemd && [ -f "/etc/systemd/system/$svc.timer" ]; then
+    systemctl disable --now "$svc.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$svc.timer" "/etc/systemd/system/$svc.service"
+    systemctl daemon-reload
+    removed=1
+  fi
+  AUTO_UPDATE=off
+  if [ "$removed" = 1 ]; then ok "已关闭自动更新"; fi
+  return 0
+}
+
 set_env_kv() { # 文件 键 值
   local f="$1" k="$2" v="$3"
   if grep -q "^$k=" "$f" 2>/dev/null; then
@@ -271,7 +460,7 @@ write_server_env() {
   chmod 750 "$CONF_DIR"
   if [ ! -f "$f" ]; then
     cat >"$f" <<EOF
-# MyProbe 主控运行参数，改完执行 myprobe.sh restart server 生效
+# MyProbe 主控运行参数，改完执行 myprobe restart server 生效
 MYPROBE_ADDR=$addr
 MYPROBE_DATA_DIR=$datadir
 # 仅首次启动生效；留空则随机生成一个并打印到日志
@@ -296,11 +485,13 @@ write_agent_env() {
   chmod 750 "$CONF_DIR"
   if [ ! -f "$f" ]; then
     cat >"$f" <<EOF
-# MyProbe 客户端运行参数，改完执行 myprobe.sh restart agent 生效
+# MyProbe 客户端运行参数，改完执行 myprobe restart agent 生效
 MYPROBE_AGENT_SERVER=$SERVER_URL
 MYPROBE_AGENT_SECRET=$SECRET
 # 留空则用后台里配置的名称
 MYPROBE_AGENT_NAME=$AGENT_NAME
+# 只统计这些网卡的流量（逗号分隔）；不填则自动跳过 lo/docker/veth 等虚拟口
+#MYPROBE_AGENT_NET_IFACES=eth0
 EOF
   fi
   set_env_kv "$f" MYPROBE_AGENT_SERVER "$SERVER_URL"
@@ -319,6 +510,19 @@ run_docker() { # comp 额外参数...
   docker run -d --name "myprobe-$comp" --restart unless-stopped \
     --env-file "$CONF_DIR/$comp.env" "$@" "$image" >/dev/null
   ok "容器 myprobe-$comp 已启动"
+}
+
+# 拉一下镜像，如果和容器正在用的是同一个 image id，就没必要重建容器。
+# 返回 0 表示已是最新。
+docker_up_to_date() { # comp
+  local comp="$1" image cur new
+  image=$(image_of "$comp")
+  cur=$(docker inspect -f '{{.Image}}' "myprobe-$comp" 2>/dev/null || true)
+  [ -n "$cur" ] || return 1
+  info "检查镜像 $image"
+  docker pull "$image" >/dev/null 2>&1 || return 1
+  new=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)
+  [ -n "$new" ] && [ "$cur" = "$new" ]
 }
 
 apply_server() {
@@ -383,13 +587,24 @@ check_mode() {
   esac
 }
 
+check_auto_update() {
+  case "$AUTO_UPDATE" in
+    on | off) ;;
+    *) die "自动更新只能是 on 或 off" ;;
+  esac
+}
+
 cmd_install_server() {
   need_root
+  reset_conf
   load_conf server || true
   pick MODE "$OPT_MODE" "${MODE:-}" "部署方式 binary/docker" binary
   check_mode
   pick PORT "$OPT_PORT" "${PORT:-}" "主控监听端口" 8000
   pick VERSION "$OPT_VERSION" "${VERSION:-}" "版本（latest 或 v1.2.3）" latest
+  # 主控默认不自动更新：升级可能带库迁移，交给人挑时间
+  pick AUTO_UPDATE "$OPT_AUTO_UPDATE" "${AUTO_UPDATE:-}" "开启每日自动更新 on/off" off
+  check_auto_update
 
   PASSWORD="$OPT_PASSWORD"
   if [ -z "$PASSWORD" ] && [ ! -f "$CONF_DIR/server.env" ]; then
@@ -399,17 +614,24 @@ cmd_install_server() {
   write_server_env
   if [ "$MODE" = binary ]; then install_binary server; fi
   apply_server
+  self_install || true
+  apply_auto_update server "$AUTO_UPDATE"
   save_conf server
 
   local ip
   ip=$(local_ip)
   ok "主控已就绪：http://${ip:-本机IP}:$PORT"
-  info "用户名 admin；没指定密码的话用 myprobe.sh logs server 看日志里那串随机密码"
+  info "用户名 admin；没指定密码的话用 myprobe logs server 看日志里那串随机密码"
+  info "被监控机器装客户端（密钥在后台添加服务器时生成）："
+  printf '  curl -fsSL http://%s:%s/install.sh | sudo bash -s -- install-agent \\\n' \
+    "${ip:-本机IP}" "$PORT"
+  printf '    --server ws://%s:%s/ws/agent --secret <密钥> --yes\n' "${ip:-本机IP}" "$PORT"
   info "对外提供服务建议自行套一层 HTTPS 反向代理"
 }
 
 cmd_install_agent() {
   need_root
+  reset_conf
   load_conf agent || true
   pick MODE "$OPT_MODE" "${MODE:-}" "部署方式 binary/docker" binary
   check_mode
@@ -418,6 +640,9 @@ cmd_install_agent() {
     "主控地址" "ws://127.0.0.1:8000/ws/agent"
   pick SECRET "$OPT_SECRET" "$(env_val agent MYPROBE_AGENT_SECRET)" "接入密钥（后台添加服务器时生成）" ""
   pick AGENT_NAME "$OPT_NAME" "$(env_val agent MYPROBE_AGENT_NAME)" "展示名（可留空）" ""
+  # 客户端通常几十上百台，默认自动更新，省得逐台登上去升级
+  pick AUTO_UPDATE "$OPT_AUTO_UPDATE" "${AUTO_UPDATE:-}" "开启每日自动更新 on/off" on
+  check_auto_update
 
   case "$SERVER_URL" in
     ws://* | wss://*) ;;
@@ -433,15 +658,18 @@ cmd_install_agent() {
   write_agent_env
   if [ "$MODE" = binary ]; then install_binary agent; fi
   apply_agent
+  self_install || true
+  apply_auto_update agent "$AUTO_UPDATE"
   save_conf agent
   ok "客户端已连向 $SERVER_URL"
+  info "看运行情况：myprobe status / myprobe logs agent"
 }
 cmd_status() {
   local comp label desc ip
   ip=$(local_ip)
-  printf '%s组件    方式      状态     版本      备注%s\n' "$C_D" "$C_0"
+  printf '%s组件    方式      状态     版本         自动更新  备注%s\n' "$C_D" "$C_0"
   for comp in server agent; do
-    MODE="" PORT="" VERSION=""
+    reset_conf
     [ "$comp" = server ] && label="主控  " || label="客户端"
     if load_conf "$comp"; then
       if [ "$comp" = server ]; then
@@ -449,7 +677,8 @@ cmd_status() {
       else
         desc=$(env_val agent MYPROBE_AGENT_SERVER)
       fi
-      printf '%s  %-8s  %s  %-8s  %s\n' "$label" "$MODE" "$(comp_state "$comp")" "${VERSION:-latest}" "$desc"
+      printf '%s  %-8s  %s  %-11s  %-8s  %s\n' "$label" "$MODE" "$(comp_state "$comp")" \
+        "${RESOLVED_VERSION:-${VERSION:-latest}}" "${AUTO_UPDATE:-off}" "$desc"
     else
       printf '%s  %-8s  %s未安装%s\n' "$label" "-" "$C_D" "$C_0"
     fi
@@ -458,7 +687,7 @@ cmd_status() {
 
 svc_cmd() { # comp start|stop|restart
   need_root
-  MODE="" PORT="" VERSION=""
+  reset_conf
   load_conf "$1" || die "myprobe-$1 尚未安装"
   if [ "$MODE" = docker ]; then
     need_docker
@@ -471,7 +700,7 @@ svc_cmd() { # comp start|stop|restart
 }
 
 cmd_logs() { # comp
-  MODE="" PORT="" VERSION=""
+  reset_conf
   load_conf "$1" || die "myprobe-$1 尚未安装"
   if [ "$MODE" = docker ]; then
     need_docker
@@ -482,22 +711,64 @@ cmd_logs() { # comp
   fi
 }
 
+cmd_auto_update() { # on|off，组件已解析到 COMP
+  need_root
+  case "${1:-}" in
+    on | off) ;;
+    *) die "用法：myprobe auto-update <on|off> [server|agent]" ;;
+  esac
+  reset_conf
+  load_conf "$COMP" || die "myprobe-$COMP 尚未安装"
+  apply_auto_update "$COMP" "$1"
+  save_conf "$COMP"
+}
+
+# 更新：先判断有没有必要动，再动；binary 模式起不来就回滚。
+# 自动更新的 timer 走的就是这个入口。
 cmd_update() { # comp
   need_root
-  MODE="" PORT="" VERSION=""
+  reset_conf
   load_conf "$1" || die "myprobe-$1 尚未安装"
-  if [ -n "$OPT_VERSION" ]; then VERSION="$OPT_VERSION"; fi
-  if [ "$MODE" = binary ]; then install_binary "$1"; fi
-  if [ "$1" = server ]; then apply_server; else apply_agent; fi
+  if [ -n "$OPT_VERSION" ]; then
+    VERSION="$OPT_VERSION"
+    RESOLVED_VERSION=""
+  fi
+
+  if [ "$MODE" = docker ]; then
+    need_docker
+    if [ "$OPT_FORCE" = 0 ] && docker_up_to_date "$1"; then
+      ok "镜像已是最新，不用重建容器"
+      return 0
+    fi
+    if [ "$1" = server ]; then apply_server; else apply_agent; fi
+  else
+    need_systemd
+    local tag
+    tag=$(resolve_version)
+    # 解析不出真实 tag（拿到 latest）时不敢判定"没变化"，老老实实重装
+    if [ "$OPT_FORCE" = 0 ] && [ "$tag" != latest ] && [ "$tag" = "$RESOLVED_VERSION" ] \
+      && [ -x "$BIN_DIR/myprobe-$1" ]; then
+      ok "已是最新版本 $tag，跳过（要强制重装加 --force）"
+      return 0
+    fi
+    install_binary "$1"
+    if [ "$1" = server ]; then apply_server; else apply_agent; fi
+    if ! verify_service "$1"; then
+      rollback_binary "$1" || die "myprobe-$1 启动失败，且没有可回滚的版本，用 myprobe logs $1 看日志"
+      # 故意不写 conf：磁盘上记的还是回滚后那个版本，下次更新会重试
+      die "myprobe-$1 启动失败，已回滚到上一个版本"
+    fi
+  fi
   save_conf "$1"
-  ok "myprobe-$1 已更新到 ${VERSION:-latest}"
+  ok "myprobe-$1 已更新到 ${RESOLVED_VERSION:-${VERSION:-latest}}"
 }
 cmd_uninstall() { # comp
   need_root
-  MODE="" PORT="" VERSION=""
+  reset_conf
   load_conf "$1" || warn "没有 myprobe-$1 的部署记录，仍按默认路径清理"
   confirm "确认卸载 myprobe-$1？" || die "已取消"
 
+  apply_auto_update "$1" off
   if command -v docker >/dev/null 2>&1; then
     docker rm -f "myprobe-$1" >/dev/null 2>&1 || true
   fi
@@ -506,7 +777,7 @@ cmd_uninstall() { # comp
     rm -f "/etc/systemd/system/myprobe-$1.service"
     systemctl daemon-reload
   fi
-  rm -f "$BIN_DIR/myprobe-$1" "$CONF_DIR/$1.conf"
+  rm -f "$BIN_DIR/myprobe-$1" "$BIN_DIR/myprobe-$1.old" "$CONF_DIR/$1.conf"
   ok "myprobe-$1 已卸载"
 
   # 数据库删了没法恢复：非交互模式下只有显式 --purge 才动它
@@ -523,6 +794,10 @@ cmd_uninstall() { # comp
     fi
   fi
   info "配置文件仍在 $CONF_DIR/$1.env，确认不再需要可手动删除"
+  if [ ! -f "$CONF_DIR/server.conf" ] && [ ! -f "$CONF_DIR/agent.conf" ] \
+    && [ -f "$BIN_DIR/myprobe" ]; then
+    info "本机已无 MyProbe 组件，这个脚本可以一起删：rm -f $BIN_DIR/myprobe"
+  fi
 }
 
 resolve_comp() { # 参数 -> 全局 COMP
@@ -544,7 +819,7 @@ menu() {
     printf '\n%s MyProbe 部署助手 %s %s%s%s\n\n' "$C_B" "$C_0" "$C_D" "$REPO" "$C_0"
     cmd_status
     printf '\n  1) 安装 / 更新主控\n  2) 安装 / 更新客户端\n  3) 查看日志\n  4) 重启\n'
-    printf '  5) 停止\n  6) 更新到最新版\n  7) 卸载\n  0) 退出\n\n'
+    printf '  5) 停止\n  6) 更新到最新版\n  7) 自动更新开关\n  8) 卸载\n  0) 退出\n\n'
     case "$(ask "请选择" 0)" in
       1) cmd_install_server ;;
       2) cmd_install_agent ;;
@@ -566,6 +841,10 @@ menu() {
         ;;
       7)
         resolve_comp ""
+        cmd_auto_update "$(ask "自动更新 on/off" on)"
+        ;;
+      8)
+        resolve_comp ""
         cmd_uninstall "$COMP"
         ;;
       0 | q | Q) exit 0 ;;
@@ -586,7 +865,8 @@ MyProbe 一键部署脚本
   status                    查看部署状态
   logs <server|agent>       跟踪日志
   start|stop|restart <组件>  启停
-  update <组件>              重新拉取并重启
+  update <组件>              有新版本才更新，起不来自动回滚
+  auto-update <on|off> <组件> 每日自动更新开关（systemd timer）
   uninstall <组件>           卸载
 
 参数:
@@ -597,10 +877,21 @@ MyProbe 一键部署脚本
   --secret <密钥>            客户端接入密钥
   --name <名称>              客户端展示名
   --version <latest|vX.Y.Z>  指定版本，默认 latest
+  --auto-update             安装时开启自动更新（客户端默认开，主控默认关）
+  --no-auto-update          安装时关闭自动更新
+  --force                   update 时即使版本没变也重装
   --purge                   卸载主控时连数据目录一起删
   -y, --yes                 非交互，全部取默认值
 
-可用环境变量覆盖路径:
+被监控机器一条命令装完客户端（脚本由主控提供，版本自动对齐）:
+  curl -fsSL http://<主控>/install.sh | sudo bash -s -- install-agent \\
+    --server ws://<主控>:8000/ws/agent --secret <密钥> --yes
+
+环境变量:
+  MYPROBE_AGENT_SECRET / MYPROBE_AGENT_SERVER / MYPROBE_AGENT_NAME
+  MYPROBE_ADMIN_PASSWORD    与同名参数等价，适合避免密钥进 shell 历史
+  MYPROBE_AGENT_NET_IFACES  客户端只统计这些网卡（逗号分隔），默认自动跳过 lo/docker/veth 等
+  MYPROBE_SCRIPT_URL        自动更新时重新下载本脚本的地址
   MYPROBE_REPO（默认 $REPO）MYPROBE_REGISTRY MYPROBE_CONF_DIR MYPROBE_DATA_HOME MYPROBE_BIN_DIR
 EOF
 }
@@ -626,6 +917,18 @@ while [ $# -gt 0 ]; do
       ;;
     --purge)
       OPT_PURGE=1
+      shift
+      ;;
+    --auto-update)
+      OPT_AUTO_UPDATE=on
+      shift
+      ;;
+    --no-auto-update)
+      OPT_AUTO_UPDATE=off
+      shift
+      ;;
+    --force)
+      OPT_FORCE=1
       shift
       ;;
     -y | --yes)
@@ -657,6 +960,10 @@ case "${1:-menu}" in
   update)
     resolve_comp "${2:-}"
     cmd_update "$COMP"
+    ;;
+  auto-update)
+    resolve_comp "${3:-}"
+    cmd_auto_update "${2:-}"
     ;;
   uninstall)
     resolve_comp "${2:-}"

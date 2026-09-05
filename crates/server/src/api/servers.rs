@@ -179,6 +179,8 @@ pub async fn destroy(
 ) -> ApiResult<serde_json::Value> {
     st.db.delete_server(id).map_err(internal)?;
     st.live.remove(id);
+    // 心跳记录也要清掉，否则 id 被复用时新机器会被判成在线
+    st.agents.forget(id);
     st.ui_broadcast();
     Ok(Json(serde_json::json!({ "ok": true })))
 }

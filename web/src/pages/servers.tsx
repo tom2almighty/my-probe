@@ -99,6 +99,15 @@ export default function ServersPage() {
       });
   }, [data, live, onlineMap, q, filter]);
 
+  // 所有机器里最高的 Agent 版本，用来标出哪台还没更新
+  const newestVersion = useMemo(() => {
+    let top: string | null = null;
+    for (const s of data ?? []) {
+      if (s.agent_version && (!top || cmpVer(s.agent_version, top) > 0)) top = s.agent_version;
+    }
+    return top;
+  }, [data]);
+
   const create = async (v: ServerFormValue) => {
     try {
       const resp = await api.createServer(v);
@@ -244,6 +253,7 @@ export default function ServersPage() {
                       <OnlineBadge online={online} />
                       {!s.enabled && <Badge variant="muted">停用</Badge>}
                     </div>
+                    <AgentVersion version={s.agent_version} newest={newestVersion} />
                   </td>
                   <td className="px-3 py-2.5">
                     <MiniUsage pct={m ? m.cpu : null} />
@@ -327,6 +337,7 @@ export default function ServersPage() {
               <div className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs">
                 <ExpireBadge days={s.days_to_expire} date={s.expire_date} />
                 <RenewInfo price={s.renew_price} cycle={s.renew_cycle} />
+                <AgentVersion version={s.agent_version} newest={newestVersion} />
                 <span className="ml-auto text-muted-foreground">
                   {m ? fmtTime(m.ts) : s.last_seen ? fmtTime(s.last_seen) : "从未连接"}
                 </span>
@@ -402,6 +413,33 @@ function MiniUsage({ label, pct: p, hint }: { label?: string; pct: number | null
       </div>
       <Progress value={p ?? 0} className="h-1" />
     </div>
+  );
+}
+
+/** 按数字段逐位比较，"0.2.0" 比 "0.1.9" 新；后缀（rc 之类）忽略。 */
+function cmpVer(a: string, b: string): number {
+  const pa = a.split(".");
+  const pb = b.split(".");
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number.parseInt(pa[i] ?? "0", 10) || 0;
+    const nb = Number.parseInt(pb[i] ?? "0", 10) || 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+/** Agent 自报的版本；比别的机器旧就标黄，一眼看出哪台没更新。 */
+function AgentVersion({ version, newest }: { version: string | null; newest: string | null }) {
+  if (!version) return null;
+  const outdated = !!newest && cmpVer(version, newest) < 0;
+  const tone = outdated ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground";
+  return (
+    <span
+      className={`text-[11px] tabular-nums ${tone}`}
+      title={outdated ? `其他机器已经是 v${newest}，这台还没更新` : `Agent v${version}`}
+    >
+      v{version}
+    </span>
   );
 }
 

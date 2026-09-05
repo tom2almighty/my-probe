@@ -27,27 +27,43 @@ Agent 只向外发起连接，被监控的机器不需要开放入站端口。
 
 ### 一键脚本（Linux）
 
-主控 / 客户端、二进制 / Docker 四种组合都由同一个脚本管理：
+主控 / 客户端、二进制 / Docker 四种组合都由同一个脚本管理。先装主控：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tom2almighty/my-probe/main/scripts/myprobe.sh -o myprobe.sh
 sudo bash myprobe.sh                 # 交互菜单
+
+# 或者一条命令跑完（Docker 方式，映射到宿主 8000）
+sudo bash myprobe.sh install-server --mode docker --port 8000 --password '换成你的密码' --yes
 ```
 
-也可以一条命令跑完：
+主控自己会在 `/install.sh` 提供同一份脚本，所以被监控机器不用再去 GitHub，装出来的版本也天然和面板对齐。在后台添加服务器拿到密钥后，弹窗里的「一键脚本」直接复制：
 
 ```bash
-# 主控：Docker 方式，映射到宿主 8000
-sudo bash myprobe.sh install-server --mode docker --port 8000 --password '换成你的密码' --yes
-
-# 被监控机器：二进制方式
-sudo bash myprobe.sh install-agent \
+curl -fsSL http://<主控 IP>:8000/install.sh | sudo bash -s -- install-agent \
   --server ws://<主控 IP>:8000/ws/agent --secret <接入密钥> --yes
 ```
 
-其余子命令：`status`、`logs <组件>`、`restart <组件>`、`update <组件>`、`uninstall <组件>`，`-h` 看完整用法。
+不想让密钥进 shell 历史就走环境变量（`MYPROBE_AGENT_SECRET`、`MYPROBE_AGENT_SERVER`、`MYPROBE_ADMIN_PASSWORD` 都与同名参数等价）：
+
+```bash
+curl -fsSL http://<主控 IP>:8000/install.sh | sudo MYPROBE_AGENT_SECRET=<接入密钥> bash -s -- \
+  install-agent --server ws://<主控 IP>:8000/ws/agent --yes
+```
+
+安装时脚本会把自己放到 `/usr/local/bin/myprobe`，之后直接敲 `myprobe`：`status`、`logs <组件>`、`restart <组件>`、`update <组件>`、`auto-update <on|off> <组件>`、`uninstall <组件>`，`-h` 看完整用法。
 
 脚本会装好 systemd 服务（或 docker 容器）、写好 `/etc/myprobe/*.env` 与数据目录 `/var/lib/myprobe`，二进制默认取静态链接的 musl 版本并校验 SHA256，服务以非 root 用户运行。
+
+**自动更新**：客户端默认开启（`--no-auto-update` 关掉），主控默认关闭（`--auto-update` 打开，升级可能带数据库迁移，建议自己挑时间）。实现是一个 systemd timer，每天跑一次 `myprobe update <组件>`：
+
+- 先解析 `releases/latest` 的真实 tag，和上次装的一样就什么都不做（Docker 模式比对镜像 ID），不会无谓重启；
+- 更新前留一份旧二进制，重启后服务没起来就自动回滚并退出非零，`systemctl status myprobe-agent-update.timer` 能看到失败；
+- 客户端重启那几秒不会误报离线：在线判定以「多久没有心跳」为准（`MYPROBE_OFFLINE_AFTER`，默认 30 秒）。
+
+后台服务器列表里每台机器会显示 Agent 自报的版本，落后的标黄，一眼看出哪台没跟上。
+
+`myprobe auto-update off agent` 随时可以关掉；`--force` 可以在版本没变化时强制重装。
 
 ### 预编译二进制
 
@@ -100,11 +116,11 @@ docker compose up -d
 
 ### 首次使用
 
-浏览器打开 `http://<主控 IP>:8000`，默认落在公开状态页，右上角进后台，用户名 `admin`。未设置 `MYPROBE_ADMIN_PASSWORD` 时会自动生成初始密码并打印到日志（`myprobe.sh logs server` / `docker logs myprobe-server`），登录后在左下角用户菜单里改掉。
+浏览器打开 `http://<主控 IP>:8000`，默认落在公开状态页，右上角进后台，用户名 `admin`。未设置 `MYPROBE_ADMIN_PASSWORD` 时会自动生成初始密码并打印到日志（`myprobe logs server` / `docker logs myprobe-server`），登录后在左下角用户菜单里改掉。
 
 然后按需要配置：
 
-1. 「服务器 → 新建」创建一台机器，页面给出该机器的接入密钥（只显示一次），拿去启动 Agent
+1. 「服务器 → 新建」创建一台机器，弹窗给出该机器的接入密钥（只显示一次）和现成的安装命令，到那台机器上执行即可
 2. 「延迟探测 → 新建」填目标地址与协议（TCP / ICMP），勾选由哪些机器去探测
 3. 「告警与通知」配置阈值与 Telegram 渠道
 
@@ -125,11 +141,14 @@ docker compose up -d
 
 ### Agent（环境变量或命令行参数）
 
-| 变量                   | 参数       | 默认值                         | 说明                              |
-| ---------------------- | ---------- | ------------------------------ | --------------------------------- |
-| `MYPROBE_AGENT_SERVER` | `--server` | `ws://127.0.0.1:8000/ws/agent` | 主控地址，HTTPS 部署时用 `wss://` |
-| `MYPROBE_AGENT_SECRET` | `--secret` | 必填                           | 后台创建服务器时发放的接入密钥    |
-| `MYPROBE_AGENT_NAME`   | `--name`   | 空                             | 展示名，留空则用后台配置的名称    |
+| 变量                       | 参数       | 默认值                         | 说明                                        |
+| -------------------------- | ---------- | ------------------------------ | ------------------------------------------- |
+| `MYPROBE_AGENT_SERVER`     | `--server` | `ws://127.0.0.1:8000/ws/agent` | 主控地址，HTTPS 部署时用 `wss://`           |
+| `MYPROBE_AGENT_SECRET`     | `--secret` | 必填                           | 后台创建服务器时发放的接入密钥              |
+| `MYPROBE_AGENT_NAME`       | `--name`   | 空                             | 展示名，留空则用后台配置的名称              |
+| `MYPROBE_AGENT_NET_IFACES` | —          | 空                             | 只统计这些网卡（逗号分隔），见下            |
+
+网卡默认自动排除回环与容器 / 网桥 / 隧道口（`lo`、`docker*`、`veth*`、`br-*`、`virbr*`、`cni*`、`cali*`、`flannel*` 等）——这些口上的流量是真实网卡流量的副本，一起相加会让 Docker 宿主机的速率翻倍。多网卡机器想只统计计费的那张口，就显式列出来，例如 `MYPROBE_AGENT_NET_IFACES=eth0`（一键脚本生成的 `/etc/myprobe/agent.env` 里留了注释行）。
 
 上报间隔、探测目标与协议都由主控下发，改动后 Agent 立即生效，无需重启。
 

@@ -83,6 +83,13 @@ interface ServerCfg {
 /** 各预置节点的基准占用，合成任意时间窗的曲线时用。 */
 const serverBase = new Map<number, ServerCfg>();
 
+/** 演示后台"哪台还没更新"：4 号从未连上过，2 号停在旧版本。 */
+function mockAgentVersion(id: number): string | null {
+  if (id === 4) return null;
+  if (id === 2) return "0.1.0";
+  return "0.1.1";
+}
+
 function makeServer(id: number, name: string, country: string, online: boolean, cfg: ServerCfg): MockServer {
   serverBase.set(id, cfg);
   const metrics = makeMetrics(48, cfg.cpu, cfg.mem);
@@ -102,6 +109,7 @@ function makeServer(id: number, name: string, country: string, online: boolean, 
     online,
     days_to_expire: cfg.daysLeft,
     secret_preview: "ab12****ef",
+    agent_version: mockAgentVersion(id),
     latest: online ? metrics[metrics.length - 1] : null,
     metrics,
   };

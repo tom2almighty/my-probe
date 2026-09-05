@@ -32,6 +32,13 @@ export function SecretDialog({ open, onOpenChange, serverName, secret }: Props) 
   const [, copyCmd] = useCopy();
   const url = agentUrl();
 
+  // 脚本由主控自己提供（/install.sh），装出来的版本天然和面板一致
+  const scriptCmd = [
+    `curl -fsSL ${location.origin}/install.sh | sudo bash -s -- install-agent \\`,
+    `  --server ${url} \\`,
+    `  --secret ${secret ?? ""} --yes`,
+  ].join("\n");
+
   const binCmd = [
     `MYPROBE_AGENT_SERVER=${url} \\`,
     `MYPROBE_AGENT_SECRET=${secret ?? ""} \\`,
@@ -40,7 +47,8 @@ export function SecretDialog({ open, onOpenChange, serverName, secret }: Props) 
 
   const dockerCmd = [
     "docker run -d --name myprobe-agent \\",
-    "  --restart always --network host --cap-add NET_RAW \\",
+    "  --restart unless-stopped --network host --pid host --cap-add NET_RAW \\",
+    "  -v /:/host:ro \\",
     `  -e MYPROBE_AGENT_SERVER=${url} \\`,
     `  -e MYPROBE_AGENT_SECRET=${secret ?? ""} \\`,
     "  ghcr.io/tom2almighty/myprobe-agent:latest",
@@ -82,11 +90,21 @@ export function SecretDialog({ open, onOpenChange, serverName, secret }: Props) 
             </div>
           </div>
 
-          <Tabs defaultValue="bin">
+          <Tabs defaultValue="script">
             <TabsList>
+              <TabsTrigger value="script">一键脚本</TabsTrigger>
               <TabsTrigger value="bin">单文件部署</TabsTrigger>
               <TabsTrigger value="docker">Docker</TabsTrigger>
             </TabsList>
+            <TabsContent value="script" className="space-y-2">
+              <CmdBlock cmd={scriptCmd} onCopy={copyCmd} />
+              <p className="text-[11px] text-muted-foreground">
+                在被监控机器上以 root 执行。脚本会装好 systemd 服务并默认开启每日自动更新（
+                <code className="font-mono">--no-auto-update</code> 可关掉）；之后用{" "}
+                <code className="font-mono">myprobe status</code> 查看状态。想用 Docker 方式加{" "}
+                <code className="font-mono">--mode docker</code>。
+              </p>
+            </TabsContent>
             <TabsContent value="bin" className="space-y-2">
               <CmdBlock cmd={binCmd} onCopy={copyCmd} />
               <p className="text-[11px] text-muted-foreground">
@@ -98,7 +116,8 @@ export function SecretDialog({ open, onOpenChange, serverName, secret }: Props) 
               <CmdBlock cmd={dockerCmd} onCopy={copyCmd} />
               <p className="text-[11px] text-muted-foreground">
                 <code className="font-mono">--network host</code> 让 Agent 读取宿主机网卡速率，
-                <code className="font-mono">--cap-add NET_RAW</code> 供 ICMP 探测使用。
+                <code className="font-mono">--cap-add NET_RAW</code> 供 ICMP 探测使用，
+                <code className="font-mono">-v /:/host:ro</code> 用于统计宿主机磁盘用量。
               </p>
             </TabsContent>
           </Tabs>

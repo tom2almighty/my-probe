@@ -89,6 +89,10 @@ struct AgentSlot {
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
     inner: Arc<Mutex<HashMap<i64, AgentSlot>>>,
+    /// 最近一次心跳时间，连接注销后依然保留。
+    /// 在线判定以"多久没有心跳"为准（README 里的 MYPROBE_OFFLINE_AFTER），
+    /// 这样 Agent 重启（含自动更新）那几秒空档不会被当成离线。
+    seen: Arc<Mutex<HashMap<i64, Instant>>>,
     conn_seq: Arc<AtomicU64>,
 }
 
@@ -105,10 +109,13 @@ impl AgentRegistry {
                 last_activity: Instant::now(),
             },
         );
+        drop(map);
+        self.seen.lock().unwrap().insert(server_id, Instant::now());
         conn_id
     }
 
     /// 注销连接（只有 conn_id 匹配时才移除，防止误删新连接）。
+    /// 心跳时间不清除：判定离线交给 offline_sweeper 按时间窗口决定。
     pub fn unregister(&self, server_id: i64, conn_id: u64) {
         let mut map = self.inner.lock().unwrap();
         if let Some(slot) = map.get(&server_id) {
@@ -118,16 +125,30 @@ impl AgentRegistry {
         }
     }
 
+    /// 服务器删除后清掉心跳记录，避免 id 复用时把新机器判成在线。
+    pub fn forget(&self, server_id: i64) {
+        self.inner.lock().unwrap().remove(&server_id);
+        self.seen.lock().unwrap().remove(&server_id);
+    }
+
     pub fn touch(&self, server_id: i64) {
         if let Some(slot) = self.inner.lock().unwrap().get_mut(&server_id) {
             slot.last_activity = Instant::now();
         }
+        self.seen.lock().unwrap().insert(server_id, Instant::now());
     }
 
-    /// 服务器当前是否有活跃连接（按阈值判定）。
+    /// 服务器当前是否在线：有活跃连接，或最近一次心跳还在阈值内。
     pub fn is_online(&self, server_id: i64, max_idle: std::time::Duration) -> bool {
-        match self.inner.lock().unwrap().get(&server_id) {
+        let live = match self.inner.lock().unwrap().get(&server_id) {
             Some(slot) => slot.last_activity.elapsed() <= max_idle,
+            None => false,
+        };
+        if live {
+            return true;
+        }
+        match self.seen.lock().unwrap().get(&server_id) {
+            Some(t) => t.elapsed() <= max_idle,
             None => false,
         }
     }
@@ -230,6 +251,8 @@ pub struct ServerView {
     pub online: bool,
     pub days_to_expire: Option<i64>,
     pub secret_preview: String,
+    /// Agent 上报的自身版本，用于看出哪台还没更新（从未连接过时为 null）。
+    pub agent_version: Option<String>,
     /// 最新一次上报的整机指标（无数据时为 null）。
     pub latest: Option<models::MetricPoint>,
 }
@@ -250,6 +273,7 @@ pub fn server_view(s: &models::Server, online: bool, latest: Option<models::Metr
         online,
         days_to_expire: s.days_to_expire(),
         secret_preview: mask_secret(&s.secret),
+        agent_version: s.agent_version.clone(),
         latest,
     }
 }
