@@ -30,7 +30,7 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -73,7 +73,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/myprobe-agent.exe" `
             -DestinationPath "myprobe-agent-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: myprobe-agent-${{ matrix.target }}
           path: myprobe-agent-${{ matrix.target }}.${{ matrix.archive }}

@@ -17,7 +17,7 @@ jobs:
     name: 前端产物
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -32,7 +32,7 @@ jobs:
         run: bun run build
 
       # 所有平台复用同一份前端产物，保证各平台二进制里的资源完全一致
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -55,10 +55,10 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest, archive: tar.gz }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # rust-embed 在编译期读 web/dist，必须先把前端产物放回原位
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -99,7 +99,7 @@ jobs:
             -DestinationPath "myprobe-server-${{ matrix.target }}.zip"
 
       # 产物名不带版本号，这样 releases/latest/download/<名字> 永远可用
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: myprobe-server-${{ matrix.target }}
           path: myprobe-server-${{ matrix.target }}.${{ matrix.archive }}

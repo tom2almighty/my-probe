@@ -35,7 +35,7 @@ jobs:
       contents: write
     steps:
       # 只取二进制包；web-dist / digest-* 这些中间产物不进 Release
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: myprobe-*
           path: dist
@@ -47,7 +47,7 @@ jobs:
 
       - name: 计算镜像属主
         run: echo "OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
