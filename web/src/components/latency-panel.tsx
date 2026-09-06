@@ -8,7 +8,7 @@ import { Flag } from "@/components/flag";
 import {
   ChartBlock,
   type LatencySeries,
-  LatencyMultiChart,
+  LatencyCompareChart,
   LatencyStrip,
   type LegendItem,
   METRIC_RANGES,
@@ -24,7 +24,7 @@ import { OkRate } from "@/components/status";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useAsync, usePersistedFlag } from "@/lib/hooks";
-import { DEFAULT_BANDS, latencyColor } from "@/lib/latency";
+import { DEFAULT_BANDS, commonBands, latencyColor } from "@/lib/latency";
 import type { LatencyBand, ProbePoint } from "@/lib/types";
 import { cn, fmtLatency, fmtTime } from "@/lib/utils";
 
@@ -36,6 +36,8 @@ export interface LatencyTarget {
   country?: string;
   /** 最近 24h 可用率，多节点对比表直接展示 */
   ok_24h?: number | null;
+  /** 该节点生效的配色（后端已按指派回退）；没带就退到面板级的 bands */
+  bands?: LatencyBand[];
 }
 
 /** 同屏对比的节点上限：线再多就糊成一团，也不想一次发十几个请求。 */
@@ -65,12 +67,14 @@ interface Fetched {
   rows: ProbePoint[][];
 }
 
-/** 参与对比的一个节点：固定色 + 该节点的曲线。 */
+/** 参与对比的一个节点：固定色 + 自己的阈值配色 + 该节点的曲线。 */
 interface CompareRow {
   target: LatencyTarget;
   color: string;
   dash?: string;
   rows: ProbePoint[];
+  /** 这条线生效的阈值配色；线色回答「哪台机器」，它才回答「快慢」 */
+  bands: LatencyBand[];
 }
 
 export function LatencyPanel({
@@ -122,14 +126,17 @@ export function LatencyPanel({
       activeIds.map((sid, i) => {
         const at = targets.findIndex((t) => t.server_id === sid);
         const idx = at < 0 ? i : at;
+        const target = targets[at] ?? { server_id: sid, server_name: `#${sid}` };
         return {
-          target: targets[at] ?? { server_id: sid, server_name: `#${sid}` },
+          target,
           color: seriesColor(idx),
           dash: seriesDash(idx),
           rows: data?.rows[i] ?? [],
+          // 配色跟着指派走：同一目标在美西和欧洲可以各有一套「健康标准」
+          bands: target.bands ?? bands,
         };
       }),
-    [activeIds, targets, data],
+    [activeIds, targets, data, bands],
   );
 
   const series = useMemo<LatencySeries[]>(
@@ -140,10 +147,10 @@ export function LatencyPanel({
         color: c.color,
         dash: c.dash,
         rows: c.rows,
-        // 同一个探测目标的多台机器，阈值当然一致，背景带能照常画
-        bands,
+        // 每条线带各自的阈值：背景带能不能画、提示框里的快慢色都按它算
+        bands: c.bands,
       })),
-    [compare, bands],
+    [compare],
   );
 
   const legend = useMemo<LegendItem[]>(
@@ -193,6 +200,8 @@ export function LatencyPanel({
   const multi = compare.length > 1;
   const rows = compare[0]?.rows ?? [];
   const st = probeStats(rows);
+  // 单节点视图（锁定在某台机器上）的阈值配色取该节点自己的
+  const self = compare[0]?.bands ?? bands;
   const total = compare.reduce((a, c) => a + c.rows.length, 0);
   const firstTs = Math.min(...compare.map((c) => c.rows[0]?.ts ?? Number.POSITIVE_INFINITY));
 
@@ -274,8 +283,17 @@ export function LatencyPanel({
 
       {multi ? (
         <>
-          <ChartBlock title="节点对比" legend={legend} hint="灰底表示所有节点同时不通">
-            <LatencyMultiChart
+          {/* 阈值齐时一张叠加图，不齐时 LatencyCompareChart 自动切成各节点小图 */}
+          <ChartBlock
+            title="节点对比"
+            legend={legend}
+            hint={
+              commonBands(series.map((s) => s.bands)) == null
+                ? "各节点阈值不同，按各自配色分图显示"
+                : "灰底表示所有节点同时不通"
+            }
+          >
+            <LatencyCompareChart
               series={series}
               from={data?.from ?? Date.now() - cfg.ms}
               to={data?.to ?? Date.now()}
@@ -283,7 +301,7 @@ export function LatencyPanel({
               smooth={smooth}
             />
           </ChartBlock>
-          <CompareTable rows={compare} bands={bands} />
+          <CompareTable rows={compare} />
         </>
       ) : (
         <>
@@ -292,11 +310,11 @@ export function LatencyPanel({
               label="当前"
               value={st.last ? (st.last.ok ? fmtLatency(st.last.latency_ms) : "丢包") : "—"}
               tone={st.last && !st.last.ok ? "danger" : "default"}
-              color={st.last?.ok ? latencyColor(bands, st.last.latency_ms) : null}
+              color={st.last?.ok ? latencyColor(self, st.last.latency_ms) : null}
             />
-            <Stat label="平均" value={fmtLatency(st.avg)} color={latencyColor(bands, st.avg)} />
+            <Stat label="平均" value={fmtLatency(st.avg)} color={latencyColor(self, st.avg)} />
             <Stat label="最小" value={fmtLatency(st.min)} />
-            <Stat label="最大" value={fmtLatency(st.max)} color={latencyColor(bands, st.max)} />
+            <Stat label="最大" value={fmtLatency(st.max)} color={latencyColor(self, st.max)} />
             <Stat label="抖动" value={st.jitter == null ? "—" : `±${Math.round(st.jitter)} ms`} />
             <Stat
               label="丢包"
@@ -305,9 +323,9 @@ export function LatencyPanel({
             />
           </div>
 
-          <LatencyStrip data={rows} bands={bands} />
+          <LatencyStrip data={rows} bands={self} />
 
-          <ProbeChart data={rows} height={height} smooth={smooth} spanMs={cfg.ms} bands={bands} />
+          <ProbeChart data={rows} height={height} smooth={smooth} spanMs={cfg.ms} bands={self} />
         </>
       )}
 
@@ -359,8 +377,9 @@ function lossTone(st: ProbeStats): string {
   return "text-emerald-600 dark:text-emerald-400";
 }
 
-/** 多节点对比时的逐节点指标表：一行一个节点，口径与单节点的六格一致。 */
-function CompareTable({ rows, bands }: { rows: CompareRow[]; bands: LatencyBand[] }) {
+/** 多节点对比时的逐节点指标表：一行一个节点，口径与单节点的六格一致。
+ *  每行按各自的阈值上色——阈值不同时这张表才是跨节点可比的颜色语义所在。 */
+function CompareTable({ rows }: { rows: CompareRow[] }) {
   return (
     <div className="overflow-x-auto rounded-md border">
       <table className="w-full text-xs">
@@ -398,7 +417,7 @@ function CompareTable({ rows, bands }: { rows: CompareRow[]; bands: LatencyBand[
                   {st.last == null ? (
                     "—"
                   ) : st.last.ok ? (
-                    <span style={{ color: latencyColor(bands, st.last.latency_ms) ?? undefined }}>
+                    <span style={{ color: latencyColor(c.bands, st.last.latency_ms) ?? undefined }}>
                       {fmtLatency(st.last.latency_ms)}
                     </span>
                   ) : (
@@ -407,13 +426,13 @@ function CompareTable({ rows, bands }: { rows: CompareRow[]; bands: LatencyBand[
                 </td>
                 <td
                   className="px-2 py-1.5 text-right tabular-nums"
-                  style={{ color: latencyColor(bands, st.avg) ?? undefined }}
+                  style={{ color: latencyColor(c.bands, st.avg) ?? undefined }}
                 >
                   {fmtLatency(st.avg)}
                 </td>
                 <td
                   className="px-2 py-1.5 text-right tabular-nums"
-                  style={{ color: latencyColor(bands, st.max) ?? undefined }}
+                  style={{ color: latencyColor(c.bands, st.max) ?? undefined }}
                 >
                   {fmtLatency(st.max)}
                 </td>

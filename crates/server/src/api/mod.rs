@@ -87,6 +87,11 @@ pub fn protected_router() -> Router<AppState> {
         )
         .route("/api/probes/{pid}", put(probes::update).delete(probes::destroy))
         .route("/api/probes/{pid}/servers", put(probes::assign))
+        // 指派级配色：同一目标在某台客户端上的独立阈值
+        .route(
+            "/api/probes/{pid}/servers/{sid}/bands",
+            put(probes::set_assignment_bands),
+        )
         .route("/api/probes/{pid}/history", get(probes::history))
         .route("/api/alerts", get(alerts::get).put(alerts::update))
         .route("/api/notifiers", get(notifiers::get).put(notifiers::update))

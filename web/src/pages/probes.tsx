@@ -1,6 +1,6 @@
 //! 延迟探测页：探测目标独立于服务器，这里集中管理并指派执行的客户端。
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -45,11 +45,12 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { countryName } from "@/lib/countries";
 import { useAsync, useErrorHandler, useUiEvents } from "@/lib/hooks";
 import { DEFAULT_BANDS, bandsGradient, bandsLabel, validateBands } from "@/lib/latency";
-import type { LatencyBand, LatencyScheme, ProbeItem, Server } from "@/lib/types";
+import type { LatencyBand, LatencyScheme, ProbeItem, ProbeTargetStat, Server } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type Filter = "all" | "enabled" | "paused";
@@ -69,6 +70,7 @@ export default function ProbesPage() {
   const [schemesOpen, setSchemesOpen] = useState(false);
   const [editing, setEditing] = useState<EditingProbe | null>(null);
   const [assigning, setAssigning] = useState<ProbeItem | null>(null);
+  const [bandsFor, setBandsFor] = useState<{ probe: ProbeItem; target: ProbeTargetStat } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProbeItem | null>(null);
 
   useUiEvents((e) => {
@@ -277,6 +279,7 @@ export default function ProbesPage() {
               }}
               onAssign={() => setAssigning(p)}
               onDelete={() => setPendingDelete(p)}
+              onBands={(t) => setBandsFor({ probe: p, target: t })}
             />
           ))}
         </div>
@@ -324,6 +327,16 @@ export default function ProbesPage() {
         onSubmit={saveAssign}
       />
 
+      <AssignmentBandsDialog
+        open={!!bandsFor}
+        onOpenChange={(v) => !v && setBandsFor(null)}
+        probe={bandsFor?.probe ?? null}
+        target={bandsFor?.target ?? null}
+        schemes={schemes.data ?? []}
+        defaultBands={bands.data ?? DEFAULT_BANDS}
+        onSaved={() => reload()}
+      />
+
       <AlertDialog open={!!pendingDelete} onOpenChange={(v) => !v && setPendingDelete(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -354,6 +367,7 @@ function ProbeCard({
   onEdit,
   onAssign,
   onDelete,
+  onBands,
 }: {
   probe: ProbeItem;
   open: boolean;
@@ -361,6 +375,8 @@ function ProbeCard({
   onEdit: () => void;
   onAssign: () => void;
   onDelete: () => void;
+  /** 点某个客户端上的调色按钮，打开该指派的配色弹窗 */
+  onBands: (target: ProbeTargetStat) => void;
 }) {
   const target = probe.protocol === "tcp" && probe.port ? `${probe.target}:${probe.port}` : probe.target;
   return (
@@ -421,7 +437,22 @@ function ProbeCard({
         ) : (
           <div className="flex flex-wrap gap-2">
             {probe.targets.map((t) => (
-              <ProbeTargetChip key={t.server_id} target={t} bands={probe.bands} />
+              <ProbeTargetChip
+                key={t.server_id}
+                target={t}
+                bands={t.bands}
+                action={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-5 rounded-sm text-muted-foreground hover:text-foreground"
+                    title={`「${probe.name}」在 ${t.server_name} 上的配色`}
+                    onClick={() => onBands(t)}
+                  >
+                    <Palette className="size-3" />
+                  </Button>
+                }
+              />
             ))}
           </div>
         )}
@@ -643,6 +674,182 @@ function SchemesDialog({
               </Button>
             </>
           )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * 指派级配色：同一探测目标在某台客户端上的独立阈值。
+ * 目标是共享的，而「多快算快」跟着链路走——美西的优化线路和欧洲的普通线路
+ * 对同一个目标各有各的健康标准，覆盖就在这里配；没覆盖时跟随目标配置。
+ */
+function AssignmentBandsDialog({
+  open,
+  onOpenChange,
+  probe,
+  target,
+  schemes,
+  defaultBands,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  probe: ProbeItem | null;
+  target: ProbeTargetStat | null;
+  schemes: LatencyScheme[];
+  defaultBands: LatencyBand[];
+  onSaved: () => void;
+}) {
+  /** 跟随目标配置 / 引用命名方案 / 自定义分段 */
+  type Mode = "follow" | "scheme" | "custom";
+  const [mode, setMode] = useState<Mode>("follow");
+  const [schemeId, setSchemeId] = useState<number | null>(null);
+  const [draft, setDraft] = useState<LatencyBand[]>(defaultBands);
+  const [saving, setSaving] = useState(false);
+  const onError = useErrorHandler();
+
+  // 打开那一刻取初值：列表页因实时事件重渲染不能打断正在编辑的草稿
+  const latest = useRef({ probe, target, defaultBands });
+  useEffect(() => {
+    latest.current = { probe, target, defaultBands };
+  });
+  useEffect(() => {
+    if (!open) return;
+    const t = latest.current.target;
+    if (t?.assign_bands && t.assign_bands.length > 0) {
+      setMode("custom");
+      setDraft(t.assign_bands.map((b) => ({ ...b })));
+      setSchemeId(null);
+    } else if (t?.assign_scheme_id != null) {
+      setMode("scheme");
+      setSchemeId(t.assign_scheme_id);
+    } else {
+      setMode("follow");
+      setSchemeId(null);
+      setDraft((latest.current.defaultBands ?? DEFAULT_BANDS).map((b) => ({ ...b })));
+    }
+  }, [open]);
+
+  const submit = async () => {
+    const { probe: p, target: t } = latest.current;
+    if (!p || !t) return;
+    if (mode === "custom") {
+      const bad = validateBands(draft);
+      if (bad) return toast.error(bad);
+    }
+    setSaving(true);
+    try {
+      await api.setAssignmentBands(p.id, t.server_id, {
+        bands: mode === "custom" ? draft : null,
+        scheme_id: mode === "scheme" ? schemeId : null,
+      });
+      toast.success("已保存该客户端的配色");
+      onSaved();
+      onOpenChange(false);
+    } catch (e) {
+      onError(e, "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!probe || !target) return null;
+  const scheme = schemes.find((s) => s.id === schemeId);
+  // 预览按当前模式应生效的那套来算：跟随 = 目标级生效配色，改过的能直接对比
+  const preview =
+    mode === "custom"
+      ? draft
+      : mode === "scheme"
+        ? (schemes.find((s) => s.id === schemeId)?.bands ?? defaultBands)
+        : (target.bands ?? defaultBands);
+  const MODES: [Mode, string][] = [
+    ["follow", "跟随目标"],
+    ["scheme", "配色方案"],
+    ["custom", "自定义"],
+  ];
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            「{probe.name}」在 {target.server_name} 上的配色
+          </DialogTitle>
+          <DialogDescription>
+            覆盖优先于目标自身的配置，只影响这一台客户端；目标编辑弹窗里的配色对其它客户端照常生效。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          <div className="flex rounded-md border p-0.5">
+            {MODES.map(([k, label]) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setMode(k)}
+                className={cn(
+                  "flex-1 rounded px-2 py-1 text-xs font-medium transition-colors",
+                  mode === k
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {mode === "scheme" &&
+            (schemes.length === 0 ? (
+              <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+                还没有配色方案，可在「延迟探测」页右上角先建一个
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                <Label htmlFor="ab-scheme">方案</Label>
+                <Select
+                  value={schemeId != null ? String(schemeId) : ""}
+                  onValueChange={(v) => setSchemeId(Number(v))}
+                >
+                  <SelectTrigger id="ab-scheme">
+                    <SelectValue placeholder="选择方案" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {schemes.map((s) => (
+                      <SelectItem key={s.id} value={String(s.id)}>
+                        {s.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ))}
+
+          {mode === "custom" ? (
+            <BandsEditor value={draft} onChange={setDraft} />
+          ) : (
+            <div className="space-y-1.5">
+              <div className="h-2 rounded-full" style={{ background: bandsGradient(preview) }} />
+              <p className="text-[11px] text-muted-foreground">
+                {mode === "follow"
+                  ? `生效中：${bandsLabel(preview)}（目标当前配置）`
+                  : scheme
+                    ? `${scheme.name}（${bandsLabel(preview)}）`
+                    : "选择一个方案"}
+              </p>
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button type="button" disabled={saving || (mode === "scheme" && schemeId == null)} onClick={submit}>
+            {saving ? "保存中…" : "保存"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -167,10 +167,13 @@ export function OkRate({ ok }: { ok: number | null }) {
 export function ProbeTargetChip({
   target,
   bands,
+  action,
 }: {
   target: ProbeTargetStat;
   /** 该探测目标生效的延迟配色，用来给延迟数字上色 */
   bands: LatencyBand[];
+  /** 尾部附加操作（如指派配色入口），可选 */
+  action?: React.ReactNode;
 }) {
   const color = target.last?.ok ? latencyColor(bands, target.last.latency_ms) : null;
   return (
@@ -194,6 +197,7 @@ export function ProbeTargetChip({
         <span className="text-muted-foreground">等待上报</span>
       )}
       <OkRate ok={target.ok_24h} />
+      {action}
     </div>
   );
 }

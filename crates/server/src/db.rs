@@ -13,6 +13,10 @@ use crate::models::{
     Server, ServerAttrs, TrafficBump, TrafficMode, TrafficPlan, TrafficUsage, default_latency_bands,
 };
 
+/// 指派级配色覆盖：(自定义分段, 引用的方案 id)。两字段独立为 None；
+/// 同时为 None 表示没有覆盖，配色解析往下回退到目标配置。
+type BandsOverride = (Option<Vec<LatencyBand>>, Option<i64>);
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -102,6 +106,9 @@ CREATE TABLE IF NOT EXISTS probes (
 CREATE TABLE IF NOT EXISTS probe_assignments (
     probe_id    INTEGER NOT NULL REFERENCES probes(id) ON DELETE CASCADE,
     server_id   INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    -- 指派级配色覆盖：同一目标在每台客户端上可以各有一套阈值（NULL = 跟随目标配置）
+    bands       TEXT,
+    scheme_id   INTEGER REFERENCES latency_schemes(id) ON DELETE SET NULL,
     PRIMARY KEY(probe_id, server_id)
 );
 CREATE INDEX IF NOT EXISTS idx_assign_server ON probe_assignments(server_id);
@@ -156,6 +163,7 @@ impl Db {
         migrate_probes(&conn)?;
         migrate_servers(&conn)?;
         migrate_probe_cols(&conn)?;
+        migrate_assignment_bands(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -614,18 +622,18 @@ impl Db {
             .collect()
     }
 
-    /// 指派给某客户端执行的探测目标。
+    /// 指派给某客户端执行的探测目标，带上该指派上的配色覆盖。
     pub fn probes_for_server(&self, server_id: i64) -> Vec<Probe> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
             .prepare(
                 "SELECT p.id, p.name, p.target, p.protocol, p.port, p.timeout_ms, p.interval_s, p.enabled,
-                        p.latency_bands, p.latency_scheme_id
+                        p.latency_bands, p.latency_scheme_id, a.bands, a.scheme_id
                  FROM probes p JOIN probe_assignments a ON a.probe_id = p.id
                  WHERE a.server_id = ?1 ORDER BY p.id",
             )
             .unwrap();
-        stmt.query_map(params![server_id], row_to_probe)
+        stmt.query_map(params![server_id], row_to_probe_assigned)
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
@@ -670,6 +678,9 @@ impl Db {
     }
 
     /// 覆盖某探测目标的客户端列表，返回受影响（新增或移除）的客户端。
+    ///
+    /// 只删被移除的、只补新增的：仍在列表里的指派原样保留，上面配置的
+    /// 指派级配色才不会每次保存目标都被清掉。
     pub fn set_probe_servers(&self, probe_id: i64, server_ids: &[i64]) -> rusqlite::Result<Vec<i64>> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
@@ -681,11 +692,13 @@ impl Db {
                 .collect();
             v
         };
-        tx.execute(
-            "DELETE FROM probe_assignments WHERE probe_id=?1",
-            params![probe_id],
-        )?;
+        let mut stmt = tx.prepare("DELETE FROM probe_assignments WHERE probe_id=?1 AND server_id=?2")?;
+        for sid in before.iter().filter(|id| !server_ids.contains(id)) {
+            stmt.execute(params![probe_id, sid])?;
+        }
+        drop(stmt);
         for sid in server_ids {
+            // OR IGNORE：已存在的指派不动，保留它的配色覆盖
             tx.execute(
                 "INSERT OR IGNORE INTO probe_assignments(probe_id, server_id) VALUES(?1, ?2)",
                 params![probe_id, sid],
@@ -695,7 +708,7 @@ impl Db {
         Ok(symmetric_diff(&before, server_ids))
     }
 
-    /// 覆盖某客户端执行的探测目标列表，返回是否有变化。
+    /// 覆盖某客户端执行的探测目标列表，返回是否有变化。同 set_probe_servers：只增删差异。
     pub fn set_server_probes(&self, server_id: i64, probe_ids: &[i64]) -> rusqlite::Result<bool> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
@@ -707,10 +720,11 @@ impl Db {
                 .collect();
             v
         };
-        tx.execute(
-            "DELETE FROM probe_assignments WHERE server_id=?1",
-            params![server_id],
-        )?;
+        let mut stmt = tx.prepare("DELETE FROM probe_assignments WHERE probe_id=?1 AND server_id=?2")?;
+        for pid in before.iter().filter(|id| !probe_ids.contains(id)) {
+            stmt.execute(params![pid, server_id])?;
+        }
+        drop(stmt);
         for pid in probe_ids {
             tx.execute(
                 "INSERT OR IGNORE INTO probe_assignments(probe_id, server_id) VALUES(?1, ?2)",
@@ -719,6 +733,48 @@ impl Db {
         }
         tx.commit()?;
         Ok(!symmetric_diff(&before, probe_ids).is_empty())
+    }
+
+    /// 全部指派上的配色覆盖，键为 (probe_id, server_id)。probe_items 组装每个客户端的
+    /// 生效配色时一次取齐，避免逐对查询。
+    pub fn assignment_bands(&self) -> HashMap<(i64, i64), BandsOverride> {
+        let c = self.conn.lock().unwrap();
+        let Ok(mut stmt) = c.prepare("SELECT probe_id, server_id, bands, scheme_id FROM probe_assignments")
+        else {
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            let bands: Option<String> = r.get(2)?;
+            Ok((
+                (r.get::<_, i64>(0)?, r.get::<_, i64>(1)?),
+                (
+                    bands.and_then(|s| serde_json::from_str(&s).ok()),
+                    r.get::<_, Option<i64>>(3)?,
+                ),
+            ))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// 覆盖某条指派上的配色。bands 与 scheme 同为 None 表示清除覆盖、跟随目标配置。
+    /// 自定义分段与方案互斥（自定义优先），调用方保证不同时给。
+    /// 返回 false 表示这条指派不存在。
+    pub fn set_assignment_bands(
+        &self,
+        probe_id: i64,
+        server_id: i64,
+        bands: Option<&[LatencyBand]>,
+        scheme_id: Option<i64>,
+    ) -> rusqlite::Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let n = c.execute(
+            "UPDATE probe_assignments SET bands=?3, scheme_id=?4 WHERE probe_id=?1 AND server_id=?2",
+            params![probe_id, server_id, bands_json(bands), scheme_id],
+        )?;
+        Ok(n > 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1085,7 +1141,20 @@ fn row_to_probe(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
             .get::<_, Option<String>>(8)?
             .and_then(|s| serde_json::from_str(&s).ok()),
         latency_scheme_id: r.get(9)?,
+        // 通用查询不 join 指派表，覆盖字段保持 None；probes_for_server 走 row_to_probe_assigned
+        assign_bands: None,
+        assign_scheme_id: None,
     })
+}
+
+/// probes_for_server 用的映射：末尾多出指派上的配色覆盖两列。
+fn row_to_probe_assigned(r: &rusqlite::Row) -> rusqlite::Result<Probe> {
+    let mut p = row_to_probe(r)?;
+    p.assign_bands = r
+        .get::<_, Option<String>>(10)?
+        .and_then(|s| serde_json::from_str(&s).ok());
+    p.assign_scheme_id = r.get(11)?;
+    Ok(p)
 }
 
 /// bands 解析不出来就当空数组：配色解析会继续往下回退，坏数据不至于挡住整张方案列表。
@@ -1147,6 +1216,20 @@ fn migrate_probe_cols(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "ALTER TABLE probes ADD COLUMN latency_scheme_id INTEGER
              REFERENCES latency_schemes(id) ON DELETE SET NULL",
+        )?;
+    }
+    Ok(())
+}
+
+/// probe_assignments 的加列式迁移：指派级配色覆盖。
+fn migrate_assignment_bands(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "probe_assignments", "bands")? {
+        tracing::info!("迁移数据库：probe_assignments 增加指派级配色列");
+        // 带 REFERENCES 的加列只允许默认 NULL，正好就是「没覆盖、跟随目标」的含义
+        conn.execute_batch(
+            "ALTER TABLE probe_assignments ADD COLUMN bands TEXT;
+             ALTER TABLE probe_assignments ADD COLUMN scheme_id INTEGER
+             REFERENCES latency_schemes(id) ON DELETE SET NULL;",
         )?;
     }
     Ok(())
@@ -1278,4 +1361,113 @@ fn range_stats(c: &Connection, sql: &str, p: impl rusqlite::Params) -> Option<(u
 fn bucket_ms(min_ts: i64, max_ts: i64, points: usize) -> i64 {
     let span = (max_ts - min_ts).max(1);
     span / points as i64 + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{RenewCycle, ServerAttrs, TrafficPlan};
+
+    /// 每个测试独占一份临时库，测试结束连同 WAL 一起删掉。
+    fn test_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "myprobe-dbtest-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Db::open(&path).unwrap(), path)
+    }
+
+    fn attrs() -> ServerAttrs {
+        ServerAttrs {
+            name: "测试机".into(),
+            country: "JP".into(),
+            note: String::new(),
+            expire_date: None,
+            never_expire: true,
+            currency: "CNY".into(),
+            renew_price: 0.0,
+            renew_cycle: RenewCycle::Month,
+            report_interval_s: 5,
+            traffic: TrafficPlan::default(),
+        }
+    }
+
+    #[test]
+    fn 重排指派保留配色覆盖() {
+        let (db, path) = test_db("assign-bands");
+        let sid = db.create_server("secret-1", &attrs()).unwrap();
+        let pid = db
+            .create_probe(
+                "p",
+                "1.1.1.1",
+                ProbeProtocol::Tcp,
+                Some(443),
+                5000,
+                60,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // 覆盖配置后，重跑一次同样的指派列表（编辑目标时的固定路径）不能把它冲掉
+        db.set_probe_servers(pid, &[sid]).unwrap();
+        let custom = [LatencyBand {
+            max_ms: Some(200),
+            color: "#22c55e".into(),
+        }];
+        assert!(db.set_assignment_bands(pid, sid, Some(&custom), None).unwrap());
+
+        db.set_probe_servers(pid, &[sid]).unwrap();
+        let got = db.assignment_bands();
+        assert_eq!(
+            got.get(&(pid, sid)).and_then(|(b, _)| b.as_deref()),
+            Some(&custom[..])
+        );
+
+        // 移除指派时覆盖随之消失；对不存在的指派设置返回 false
+        db.set_probe_servers(pid, &[]).unwrap();
+        assert!(db.assignment_bands().is_empty());
+        assert!(!db.set_assignment_bands(pid, sid, Some(&custom), None).unwrap());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn 指派覆盖与方案互斥落库() {
+        let (db, path) = test_db("assign-mutual");
+        let sid = db.create_server("secret-2", &attrs()).unwrap();
+        let pid = db
+            .create_probe(
+                "p",
+                "1.1.1.1",
+                ProbeProtocol::Tcp,
+                Some(443),
+                5000,
+                60,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        db.set_probe_servers(pid, &[sid]).unwrap();
+
+        // 清除覆盖：两列都置空，probes_for_server 回读到 None
+        assert!(db.set_assignment_bands(pid, sid, None, None).unwrap());
+        let probes = db.probes_for_server(sid);
+        assert!(probes[0].assign_bands.is_none() && probes[0].assign_scheme_id.is_none());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

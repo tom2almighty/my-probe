@@ -349,6 +349,13 @@ pub struct Probe {
     /// 引用的命名方案；None = 跟随全局默认。自定义分段优先于方案。
     #[serde(default)]
     pub latency_scheme_id: Option<i64>,
+    /// 指派级配色覆盖（probe_assignments 上的）：同一目标在不同客户端上可以各有一套阈值，
+    /// 比如美西和欧洲到同一目标的「健康标准」不同。只有 `probes_for_server` 填充，
+    /// 其余查询保持 None（= 没有覆盖，往下回退）。
+    #[serde(default)]
+    pub assign_bands: Option<Vec<LatencyBand>>,
+    #[serde(default)]
+    pub assign_scheme_id: Option<i64>,
 }
 
 /// 主控下发给 agent 的探测配置（去掉主控侧独有字段）。

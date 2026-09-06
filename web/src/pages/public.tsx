@@ -234,7 +234,6 @@ function ServerCard({
 
 /** 线路卡片：一个探测目标 + 它在各节点上的表现，点开看曲线。 */
 function ProbeCard({ probe, open, onToggle }: { probe: ProbeItem; open: boolean; onToggle: () => void }) {
-  const target = probe.protocol === "tcp" && probe.port ? `${probe.target}:${probe.port}` : probe.target;
   return (
     <Card>
       <CardContent className="space-y-3 p-4">
@@ -256,7 +255,7 @@ function ProbeCard({ probe, open, onToggle }: { probe: ProbeItem; open: boolean;
                 {probe.protocol}
               </Badge>
             </div>
-            <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">{target}</div>
+            {/* 公开页刻意不展示探测地址：访客只需要名称与状态，具体目标属于运维细节 */}
           </div>
           <span className="shrink-0 text-[11px] text-muted-foreground">每 {probe.interval_s}s 一次</span>
         </button>
@@ -264,7 +263,7 @@ function ProbeCard({ probe, open, onToggle }: { probe: ProbeItem; open: boolean;
         {probe.targets.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {probe.targets.map((t) => (
-              <ProbeTargetChip key={t.server_id} target={t} bands={probe.bands} />
+              <ProbeTargetChip key={t.server_id} target={t} bands={t.bands} />
             ))}
           </div>
         )}

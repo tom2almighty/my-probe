@@ -10,7 +10,7 @@ import {
   ChartBlock,
   LOAD_SERIES,
   type LatencySeries,
-  LatencyMultiChart,
+  LatencyCompareChart,
   METRIC_RANGES,
   MetricChart,
   NET_SERIES,
@@ -108,14 +108,15 @@ export default function PublicServerPage() {
         color: seriesColor(i),
         dash: seriesDash(i),
         rows: histories.data?.rows[i] ?? [],
-        bands: p.bands,
+        // 阈值跟着指派走：这台机器对该目标的生效配色，没覆盖才退到目标级
+        bands: p.targets.find((t) => t.server_id === id)?.bands ?? p.bands,
       })),
-    [probes, histories.data],
+    [probes, histories.data, id],
   );
 
-  // 这张图里一条线一个探测目标，各自的阈值可能来自不同配色方案：
-  // 阈值不一致时图表不画背景色带，这里顺手说明一句，免得以为是漏了
-  const mixedBands = commonBands(probes.map((p) => p.bands)) == null;
+  // 一条线一个探测目标，各自的阈值可能来自不同配色方案或指派覆盖：
+  // 阈值不一致时 LatencyCompareChart 自动切成按各自配色的小图，这里提示一句免得以为漏了
+  const mixedBands = commonBands(latency.map((s) => s.bands)) == null;
 
   if (!srv) {
     return (
@@ -240,9 +241,9 @@ export default function PublicServerPage() {
                 <ChartBlock
                   title="延迟对比"
                   legend={latency}
-                  hint={mixedBands ? "各目标阈值不同，未画背景色带" : undefined}
+                  hint={mixedBands ? "各目标阈值不同，按各自配色分图显示" : "灰底表示所有目标同时不通"}
                 >
-                  <LatencyMultiChart
+                  <LatencyCompareChart
                     series={latency}
                     from={histories.data?.from ?? Date.now() - cfg.ms}
                     to={histories.data?.to ?? Date.now()}
@@ -294,7 +295,8 @@ function ProbeRow({
   onToggle: () => void;
 }) {
   const st = probeStats(rows);
-  const target = probe.protocol === "tcp" && probe.port ? `${probe.target}:${probe.port}` : probe.target;
+  // 这台机器对该目标的生效配色：指派覆盖过的和叠加图里的阈值保持一致
+  const bands = probe.targets.find((t) => t.server_id === serverId)?.bands ?? probe.bands;
   const stat = probe.targets.find((t) => t.server_id === serverId);
   return (
     <div className="rounded-lg border bg-background">
@@ -309,12 +311,12 @@ function ProbeRow({
         <Badge variant="outline" className="font-mono uppercase">
           {probe.protocol}
         </Badge>
-        <span className="truncate font-mono text-xs text-muted-foreground">{target}</span>
+        {/* 与线路对比页保持一致：公开面不展示探测地址 */}
         <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
           <Cell label="当前">
             {st.last ? (
               st.last.ok ? (
-                <span style={{ color: latencyColor(probe.bands, st.last.latency_ms) ?? undefined }}>
+                <span style={{ color: latencyColor(bands, st.last.latency_ms) ?? undefined }}>
                   {fmtLatency(st.last.latency_ms)}
                 </span>
               ) : (
@@ -325,9 +327,7 @@ function ProbeRow({
             )}
           </Cell>
           <Cell label="平均">
-            <span style={{ color: latencyColor(probe.bands, st.avg) ?? undefined }}>
-              {fmtLatency(st.avg)}
-            </span>
+            <span style={{ color: latencyColor(bands, st.avg) ?? undefined }}>{fmtLatency(st.avg)}</span>
           </Cell>
           <Cell label="抖动">{st.jitter == null ? "—" : `±${Math.round(st.jitter)} ms`}</Cell>
           <Cell label="丢包">{st.count === 0 ? "—" : `${(st.loss * 100).toFixed(1)}%`}</Cell>
@@ -344,7 +344,7 @@ function ProbeRow({
             load={api.publicProbeHistory}
             lockedServerId={serverId}
             span={span}
-            bands={probe.bands}
+            bands={bands}
             height={180}
           />
         </div>

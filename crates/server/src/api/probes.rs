@@ -23,6 +23,11 @@ pub struct ProbeTargetStat {
     /// 最近 24h 可用率（0-1），无数据为 null。
     pub ok_24h: Option<f64>,
     pub avg_latency_ms: Option<f64>,
+    /// 这条指派生效的配色（指派覆盖 → 方案 → 全局默认），前端逐节点着色用。
+    pub bands: Vec<LatencyBand>,
+    /// 指派上的覆盖状态：编辑弹窗靠它区分「跟随 / 方案 / 自定义」，没覆盖时为 null。
+    pub assign_bands: Option<Vec<LatencyBand>>,
+    pub assign_scheme_id: Option<i64>,
 }
 
 /// 探测列表条目：探测本身 + 每个执行客户端的最新状态。
@@ -109,7 +114,22 @@ impl BandResolver {
 
     /// 空数组一律当没配：方案被删（id 已被外键置空）或数据坏掉时继续往下回退，
     /// 前端拿到的 `bands` 永远是可以直接画的。
+    ///
+    /// 优先级：指派覆盖 → 指派方案 → 目标自定义 → 目标方案 → 全局默认。
+    /// 前两级来自 probe_assignments（probes_for_server / probe_items 已填到 Probe 上），
+    /// 让「同一目标在美西和欧洲可以各有一套健康标准」成为可能。
     pub fn resolve(&self, p: &Probe) -> Vec<LatencyBand> {
+        if let Some(b) = p.assign_bands.as_ref().filter(|b| !b.is_empty()) {
+            return b.clone();
+        }
+        if let Some(b) = p
+            .assign_scheme_id
+            .and_then(|id| self.schemes.iter().find(|s| s.id == id))
+            .map(|s| s.bands.clone())
+            .filter(|b| !b.is_empty())
+        {
+            return b;
+        }
         if let Some(b) = p.latency_bands.as_ref().filter(|b| !b.is_empty()) {
             return b.clone();
         }
@@ -230,6 +250,8 @@ fn dup_name(e: rusqlite::Error) -> ApiErr {
 pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
     let servers = st.db.list_servers();
     let assignments = st.db.probe_assignments();
+    // 指派级配色覆盖一次取齐：逐对查会变成 N×M 条 SQL
+    let overrides = st.db.assignment_bands();
     let bands = BandResolver::load(st);
     st.db
         .list_probes()
@@ -246,7 +268,13 @@ pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
                 .filter(|s| server_ids.contains(&s.id))
                 .filter(|s| !public || s.enabled)
                 .map(|s| {
-                    let v = probe_view(st, &p, s.id, &bands);
+                    // 目标是共享的，覆盖跟着指派走：先把覆盖填进探测副本再解析
+                    let mut pp = p.clone();
+                    if let Some((b, sid)) = overrides.get(&(p.id, s.id)) {
+                        pp.assign_bands = b.clone();
+                        pp.assign_scheme_id = *sid;
+                    }
+                    let v = probe_view(st, &pp, s.id, &bands);
                     ProbeTargetStat {
                         server_id: s.id,
                         server_name: s.name.clone(),
@@ -255,6 +283,9 @@ pub fn probe_items(st: &AppState, public: bool) -> Vec<ProbeItem> {
                         last: v.last,
                         ok_24h: v.ok_24h,
                         avg_latency_ms: v.avg_latency_ms,
+                        bands: v.bands,
+                        assign_bands: pp.assign_bands,
+                        assign_scheme_id: pp.assign_scheme_id,
                     }
                 })
                 .collect();
@@ -499,6 +530,53 @@ pub async fn assign(
 }
 
 #[derive(Deserialize)]
+pub struct AssignmentBandsReq {
+    /// 自定义分段；null = 不用自定义
+    #[serde(default)]
+    pub bands: Option<Vec<LatencyBand>>,
+    /// 引用的命名方案；null = 不引用。两者都为 null 表示清除覆盖、跟随目标配置
+    #[serde(default)]
+    pub scheme_id: Option<i64>,
+}
+
+/// 指派级配色：同一探测目标在某台客户端上的独立阈值。
+/// 典型场景是美西与欧洲到同一目标各有各的「健康标准」，配色不再被迫共用。
+pub async fn set_assignment_bands(
+    State(st): State<AppState>,
+    _: crate::auth::AuthUser,
+    Path((pid, sid)): Path<(i64, i64)>,
+    Json(req): Json<AssignmentBandsReq>,
+) -> ApiResult<serde_json::Value> {
+    st.db
+        .get_probe(pid)
+        .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "探测目标不存在"))?;
+    st.db
+        .get_server(sid)
+        .ok_or(ApiErr::new(StatusCode::NOT_FOUND, "服务器不存在"))?;
+    if let Some(bands) = &req.bands {
+        validate_bands(bands).map_err(|m| ApiErr::new(StatusCode::BAD_REQUEST, m))?;
+    }
+    if let Some(id) = req.scheme_id {
+        check_scheme(&st, Some(id))?;
+    }
+    // 自定义分段与方案互斥、自定义优先，与目标级配置保持同一套语义
+    let scheme_id = if req.bands.is_some() { None } else { req.scheme_id };
+    let ok = st
+        .db
+        .set_assignment_bands(pid, sid, req.bands.as_deref(), scheme_id)
+        .map_err(internal)?;
+    if !ok {
+        return Err(ApiErr::new(
+            StatusCode::BAD_REQUEST,
+            "该探测尚未指派给这台客户端，先指派再配色",
+        ));
+    }
+    // 配色不影响 Agent 行为，广播让浏览器重新拉列表即可
+    st.ui_broadcast();
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
 pub struct HistoryQuery {
     #[serde(default = "default_history_ms")]
     pub since_ms: i64,
@@ -546,4 +624,85 @@ pub async fn history(
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Vec<ProbePoint>> {
     Ok(Json(history_points(&st, pid, &q)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myprobe_shared::protocol::ProbeProtocol;
+
+    fn band(max_ms: Option<u64>, color: &str) -> LatencyBand {
+        LatencyBand {
+            max_ms,
+            color: color.into(),
+        }
+    }
+
+    fn scheme(id: i64, bands: Vec<LatencyBand>) -> LatencyScheme {
+        LatencyScheme {
+            id,
+            name: format!("方案{id}"),
+            bands,
+        }
+    }
+
+    fn probe(assign_bands: Option<Vec<LatencyBand>>, assign_scheme_id: Option<i64>) -> Probe {
+        Probe {
+            id: 1,
+            name: "p".into(),
+            target: "1.1.1.1".into(),
+            protocol: ProbeProtocol::Tcp,
+            port: Some(443),
+            timeout_ms: 5000,
+            interval_s: 60,
+            enabled: true,
+            latency_bands: None,
+            latency_scheme_id: None,
+            assign_bands,
+            assign_scheme_id,
+        }
+    }
+
+    fn resolver() -> BandResolver {
+        BandResolver {
+            schemes: vec![
+                scheme(1, vec![band(Some(150), "#22c55e"), band(None, "#ef4444")]),
+                scheme(2, vec![band(Some(300), "#f59e0b"), band(None, "#ef4444")]),
+            ],
+            defaults: vec![band(Some(100), "#22c55e"), band(None, "#ef4444")],
+        }
+    }
+
+    #[test]
+    fn 配色按指派_方案_目标_默认逐级回退() {
+        let r = resolver();
+
+        // 指派自定义 > 指派方案
+        let mut p = probe(
+            Some(vec![band(Some(180), "#3b82f6"), band(None, "#ef4444")]),
+            Some(1),
+        );
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(180));
+        p.assign_bands = None;
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(150));
+
+        // 指派方案 > 目标自定义 > 目标方案 > 全局默认
+        p.latency_bands = Some(vec![band(Some(400), "#8b5cf6"), band(None, "#ef4444")]);
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(150));
+        p.assign_scheme_id = None;
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(400));
+        p.latency_bands = None;
+        p.latency_scheme_id = Some(2);
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(300));
+        p.latency_scheme_id = None;
+        assert_eq!(r.resolve(&p), r.defaults);
+    }
+
+    #[test]
+    fn 坏掉的覆盖当作没配继续回退() {
+        let r = resolver();
+        // 空数组一律当没配：方案被删后留下的空壳不该把前端画崩
+        let p = probe(Some(vec![]), Some(1));
+        assert_eq!(r.resolve(&p)[0].max_ms, Some(150));
+    }
 }

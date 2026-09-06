@@ -395,6 +395,7 @@ export function ProbeChart({
   smooth = false,
   spanMs = 0,
   bands = DEFAULT_BANDS,
+  timeDomain,
 }: {
   data: ProbePoint[];
   height?: number;
@@ -402,6 +403,8 @@ export function ProbeChart({
   spanMs?: number;
   /** 阈值配色画成背景带；曲线保持中性色，颜色语义不打架 */
   bands?: LatencyBand[];
+  /** 显式时间窗。小倍数视图靠它对齐各节点的横轴，不然空档期看不出对比 */
+  timeDomain?: [number, number];
 }) {
   if (!data.length) return <EmptyChart />;
   const rows = data.map((p) => ({
@@ -422,7 +425,7 @@ export function ProbeChart({
             dataKey="ts"
             type="number"
             scale="time"
-            domain={["dataMin", "dataMax"]}
+            domain={timeDomain ?? ["dataMin", "dataMax"]}
             tickFormatter={(t: number) => fmtAxis(t, spanMs)}
             stroke="var(--border)"
             tick={{ fontSize: 11, fill: "var(--muted-foreground)" }}
@@ -729,6 +732,94 @@ export function LatencyMultiChart({
           ))}
         </ComposedChart>
       </ResponsiveContainer>
+    </div>
+  );
+}
+
+/** 小倍数视图里的一格：节点名 + 当前值，配各自阈值背景带的小图。 */
+function SeriesMini({
+  s,
+  from,
+  to,
+  smooth,
+}: {
+  s: LatencySeries;
+  from: number;
+  to: number;
+  smooth: boolean;
+}) {
+  const bands = s.bands ?? DEFAULT_BANDS;
+  const last = s.rows[s.rows.length - 1];
+  return (
+    <div className="rounded-lg border bg-background p-2.5">
+      <div className="mb-1.5 flex items-center gap-1.5 text-xs">
+        {/* 线样式与图里那条线一致；色块代表「哪台机器」，延迟值才按阈值上色 */}
+        <span
+          className="w-3 shrink-0 border-t-2"
+          style={{ borderColor: s.color, borderStyle: s.dash ? "dashed" : "solid" }}
+        />
+        <span className="truncate font-medium">{s.label}</span>
+        {last ? (
+          last.ok && last.latency_ms != null ? (
+            <span
+              className="ml-auto shrink-0 tabular-nums"
+              style={{ color: latencyColor(bands, last.latency_ms) ?? undefined }}
+            >
+              {fmtLatency(last.latency_ms)}
+            </span>
+          ) : (
+            <span className="ml-auto shrink-0 text-red-600 dark:text-red-400">丢包</span>
+          )
+        ) : (
+          <span className="ml-auto shrink-0 text-muted-foreground">暂无数据</span>
+        )}
+      </div>
+      {s.rows.length > 0 ? (
+        <ProbeChart
+          data={s.rows}
+          height={140}
+          smooth={smooth}
+          spanMs={to - from}
+          bands={bands}
+          timeDomain={[from, to]}
+        />
+      ) : (
+        <div className="flex h-[140px] items-center justify-center rounded-md border border-dashed text-xs text-muted-foreground">
+          该时段没有采样
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 多线延迟对比的统一入口：所有线共用一套阈值时叠加成一张图并画背景带；
+ * 阈值不齐时退化为小倍数——每条线一张迷你图、共享时间窗、各自画自己的背景带。
+ * 后者的意义在于配色语义跨节点成立（美西的绿和欧洲的绿阈值不同），并排小图
+ * 比没有背景带的叠加图更不容易误读。
+ */
+export function LatencyCompareChart({
+  series,
+  from,
+  to,
+  height = 220,
+  smooth = true,
+}: {
+  series: LatencySeries[];
+  from: number;
+  to: number;
+  height?: number;
+  smooth?: boolean;
+}) {
+  const shared = commonBands(series.map((s) => s.bands));
+  if (shared) {
+    return <LatencyMultiChart series={series} from={from} to={to} height={height} smooth={smooth} />;
+  }
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {series.map((s) => (
+        <SeriesMini key={s.key} s={s} from={from} to={to} smooth={smooth} />
+      ))}
     </div>
   );
 }

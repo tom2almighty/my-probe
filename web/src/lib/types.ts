@@ -134,6 +134,17 @@ export interface ProbeTargetStat {
   last: ProbePoint | null;
   ok_24h: number | null;
   avg_latency_ms: number | null;
+  /** 这条指派生效的配色（指派覆盖 → 方案 → 全局默认），前端逐节点着色用 */
+  bands: LatencyBand[];
+  /** 指派上的覆盖状态，编辑弹窗靠它区分「跟随 / 方案 / 自定义」；未覆盖为 null */
+  assign_bands: LatencyBand[] | null;
+  assign_scheme_id: number | null;
+}
+
+/** 设置指派级配色的请求体。两者都为 null 表示清除覆盖、跟随目标配置。 */
+export interface AssignmentBandsInput {
+  bands: LatencyBand[] | null;
+  scheme_id: number | null;
 }
 
 /** 探测列表条目：探测本身 + 指派的客户端。 */

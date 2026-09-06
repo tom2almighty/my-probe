@@ -19,6 +19,7 @@ import {
 import { makeTraffic, usedBy } from "./traffic";
 import type {
   AlertRules,
+  AssignmentBandsInput,
   CreateServerResp,
   LatencyBand,
   LatencyScheme,
@@ -164,6 +165,8 @@ export interface ApiClient {
   deleteProbe(pid: number): Promise<void>;
   /** 覆盖执行该探测的客户端 */
   assignProbeServers(pid: number, serverIds: number[]): Promise<void>;
+  /** 指派级配色：同一目标在某台客户端上的独立阈值；bands 与 scheme_id 同为 null 表示跟随目标 */
+  setAssignmentBands(pid: number, serverId: number, body: AssignmentBandsInput): Promise<void>;
   /** 全局默认延迟配色（未单独配置的探测目标都跟着它） */
   latencyBands(): Promise<LatencyBand[]>;
   saveLatencyBands(bands: LatencyBand[]): Promise<void>;
@@ -240,6 +243,11 @@ const realApi: ApiClient = {
       method: "PUT",
       body: JSON.stringify({ server_ids: serverIds }),
     }).then(() => undefined),
+  setAssignmentBands: (pid, serverId, body) =>
+    request(`/api/probes/${pid}/servers/${serverId}/bands`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }).then(() => undefined),
   latencyBands: () => request("/api/latency-bands"),
   saveLatencyBands: (bands) =>
     request("/api/latency-bands", { method: "PUT", body: JSON.stringify(bands) }).then(() => undefined),
@@ -280,6 +288,8 @@ const state = {
   status: structuredClone(mockStatus) as StatusResp,
   bands: structuredClone(DEFAULT_BANDS) as LatencyBand[],
   schemes: mockLatencySchemes.map((s) => structuredClone(s)) as LatencyScheme[],
+  /** 指派级配色覆盖，键 `pid:sid`；mock 里默认空，界面可以真实改 */
+  assignmentBands: {} as Record<string, { bands: LatencyBand[] | null; scheme_id: number | null }>,
 };
 
 const mockDelay = <T>(v: T): Promise<T> => new Promise((resolve) => setTimeout(() => resolve(v), 120));
@@ -322,11 +332,29 @@ function probeFields(p: MockProbe): Probe {
 
 /**
  * 主控在接口里就把配色回退好了，mock 也照做，前端不用再兜一次。
- * 优先级与 `BandResolver::resolve` 一致：自定义 → 方案 → 全局默认。
+ * 优先级与 `BandResolver::resolve` 一致：指派覆盖 → 指派方案 → 自定义 → 方案 → 全局默认。
+ * `serverId` 省略时只按目标级配置解析。
  */
-function effectiveBands(p: MockProbe): LatencyBand[] {
+function effectiveBands(p: MockProbe, serverId?: number): LatencyBand[] {
+  const o = serverId == null ? undefined : state.assignmentBands[`${p.id}:${serverId}`];
+  const assigned = o
+    ? resolveBands(
+        o.bands ?? undefined,
+        resolveBands(state.schemes.find((s) => s.id === o.scheme_id)?.bands, state.bands),
+      )
+    : null;
   const scheme = state.schemes.find((s) => s.id === p.latency_scheme_id);
-  return resolveBands(p.latency_bands, resolveBands(scheme?.bands, state.bands));
+  return resolveBands(assigned, resolveBands(p.latency_bands, resolveBands(scheme?.bands, state.bands)));
+}
+
+/** 指派上有没有配色覆盖，targets 的 assign_* 字段用。 */
+function assignmentBandsOf(p: MockProbe, serverId: number) {
+  const o = state.assignmentBands[`${p.id}:${serverId}`];
+  if (!o) return { assign_bands: null, assign_scheme_id: null };
+  return {
+    assign_bands: o.bands ? o.bands.map((b) => ({ ...b })) : null,
+    assign_scheme_id: o.scheme_id,
+  };
 }
 
 /** 只有预置样本有历史曲线，界面上新建的探测显示“暂无数据”。 */
@@ -345,6 +373,8 @@ function probeItem(p: MockProbe, publicOnly = false): ProbeItem {
       country: s.country,
       online: s.online,
       ...statFor(p.id, s.id),
+      bands: effectiveBands(p, s.id),
+      ...assignmentBandsOf(p, s.id),
     }));
   return {
     ...probeFields(p),
@@ -357,7 +387,7 @@ function probeItem(p: MockProbe, publicOnly = false): ProbeItem {
 }
 
 function probeViewFor(p: MockProbe, serverId: number): ProbeView {
-  return { ...probeFields(p), bands: effectiveBands(p), ...statFor(p.id, serverId) };
+  return { ...probeFields(p), bands: effectiveBands(p, serverId), ...statFor(p.id, serverId) };
 }
 
 function applyProbeInput(p: MockProbe, body: ProbeInput) {
@@ -518,7 +548,23 @@ const mockApi: ApiClient = {
     await sleep(200);
     const p = state.probes.find((x) => x.id === pid);
     if (!p) throw new Error("探测目标不存在");
+    // 移除指派时覆盖跟着消失，与主控的 DELETE 行为一致
+    for (const sid of p.server_ids) {
+      if (!serverIds.includes(sid)) delete state.assignmentBands[`${pid}:${sid}`];
+    }
     p.server_ids = [...serverIds];
+  },
+  async setAssignmentBands(pid, serverId, body) {
+    await sleep(200);
+    const p = state.probes.find((x) => x.id === pid);
+    if (!p?.server_ids.includes(serverId)) throw new Error("该探测尚未指派给这台客户端");
+    const key = `${pid}:${serverId}`;
+    if (body.bands == null && body.scheme_id == null) delete state.assignmentBands[key];
+    else
+      state.assignmentBands[key] = {
+        bands: body.bands ? body.bands.map((b) => ({ ...b })) : null,
+        scheme_id: body.scheme_id,
+      };
   },
   latencyBands: async () => mockDelay(state.bands.map((b) => ({ ...b }))),
   async saveLatencyBands(bands) {
